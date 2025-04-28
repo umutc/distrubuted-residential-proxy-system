@@ -1,10 +1,12 @@
 import { ApiGatewayManagementApi, PostToConnectionCommand } from '@aws-sdk/client-apigatewaymanagementapi';
 import { APIGatewayProxyWebsocketEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 import { validateMessage } from '../utils/schema-validator';
+import { markAgentAsAvailable } from '../utils/agent-registry';
 // import { createMetric } from '../utils/metrics'; // Placeholder for future metrics
 // import AWS from 'aws-sdk'; // For SQS dead-letter queue if needed
 import { DynamoDBClient, UpdateItemCommand } from '@aws-sdk/client-dynamodb';
 import { v4 as uuidv4 } from 'uuid';
+import { AgentInfo } from '../utils/types';
 
 const dynamoDb = new DynamoDBClient({});
 const TABLE_NAME = process.env.AGENT_REGISTRY_TABLE_NAME;
@@ -63,15 +65,19 @@ export const handler = async (event: APIGatewayProxyWebsocketEventV2): Promise<A
       case 'register': {
         const { agentId, capabilities, metadata } = body.data;
         if (!TABLE_NAME) throw new Error('AGENT_REGISTRY_TABLE_NAME not set');
-        // Store agent info in DynamoDB
+        // Store agent info and set status to available
         await dynamoDb.send(new UpdateItemCommand({
           TableName: TABLE_NAME,
           Key: { connectionId: { S: connectionId } },
-          UpdateExpression: 'SET agentId = :agentId, capabilities = :capabilities, metadata = :metadata, updatedAt = :updatedAt',
+          UpdateExpression: 'SET agentId = :agentId, capabilities = :capabilities, metadata = :metadata, #status = :status, updatedAt = :updatedAt',
+          ExpressionAttributeNames: {
+            '#status': 'status' // Alias for reserved keyword
+          },
           ExpressionAttributeValues: {
             ':agentId': { S: agentId },
-            ':capabilities': { S: JSON.stringify(capabilities) },
+            ':capabilities': { S: JSON.stringify(capabilities || []) }, // Ensure capabilities is array
             ':metadata': { S: JSON.stringify(metadata || {}) },
+            ':status': { S: 'available' }, // Set status to available on registration
             ':updatedAt': { S: new Date().toISOString() }
           }
         }));
@@ -87,9 +93,58 @@ export const handler = async (event: APIGatewayProxyWebsocketEventV2): Promise<A
         break;
       }
       case 'job_response': {
-        const { jobId, status, result, error } = body.data;
+        // Validate job_response data structure
+        if (!body.data || typeof body.data !== 'object') {
+            console.warn(`Invalid job_response: Missing or invalid data field.`);
+            await api.send(new PostToConnectionCommand({
+              ConnectionId: connectionId,
+              Data: Buffer.from(JSON.stringify({ error: 'Invalid job_response: Missing data field', requestId: body.requestId || requestId }))
+            }));
+            statusCode = 400;
+            break; // Exit case
+        }
+
+        const { jobId, status, result, error: jobError } = body.data; // Rename error to avoid conflict
+
+        if (!jobId || typeof jobId !== 'string') {
+            console.warn(`Invalid job_response: Missing or invalid jobId.`);
+            await api.send(new PostToConnectionCommand({
+              ConnectionId: connectionId,
+              Data: Buffer.from(JSON.stringify({ error: 'Invalid job_response: Missing or invalid jobId', requestId: body.requestId || requestId }))
+            }));
+            statusCode = 400;
+            break; // Exit case
+        }
+
+        if (!status || !['success', 'failure'].includes(status)) {
+            console.warn(`Invalid job_response for ${jobId}: Missing or invalid status (${status}).`);
+            await api.send(new PostToConnectionCommand({
+              ConnectionId: connectionId,
+              Data: Buffer.from(JSON.stringify({ error: `Invalid job_response: Missing or invalid status: ${status}`, jobId: jobId, requestId: body.requestId || requestId }))
+            }));
+            statusCode = 400;
+            break; // Exit case
+        }
+
         // Log job response (actual job processing logic would go here)
-        console.log(`Received job response for job ${jobId} with status ${status}`);
+         console.log(`Received job response for job ${jobId} with status ${status}`);
+        if (status === 'success' && result) {
+          console.log(`[${jobId}] Result: StatusCode=${result.statusCode}, Base64Encoded=${result.isBase64Encoded}`);
+          // TODO (Future Task): Store successful result in JobRepository/DynamoDB
+        } else if (status === 'failure' && jobError) {
+          console.error(`[${jobId}] Error: ${jobError.message}, StatusCode=${jobError.statusCode}`);
+          // TODO (Future Task): Store error details in JobRepository/DynamoDB
+        }
+
+        // --- Mark Agent as Available --- 
+        const markedAvailable = await markAgentAsAvailable(connectionId);
+        if (!markedAvailable) {
+          // Log the error, but proceed with acknowledgement - don't block response path
+          console.error(`[${jobId}] Failed to mark agent ${connectionId} as available after job completion.`);
+          // Consider adding a metric here
+        }
+
+        // --- Send Acknowledgement --- 
         await api.send(new PostToConnectionCommand({
           ConnectionId: connectionId,
           Data: Buffer.from(JSON.stringify({
