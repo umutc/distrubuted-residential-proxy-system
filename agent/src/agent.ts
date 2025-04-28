@@ -1,17 +1,21 @@
 import WebSocket from 'ws';
 import dotenv from 'dotenv';
 import { request } from 'undici';
+import { setTimeout, clearTimeout } from 'node:timers'; // Explicit Node timers
+import { Buffer } from 'node:buffer'; // Explicit Node buffer
+import process from 'node:process'; // Explicit Node process
 
 // Load environment variables from .env file
 dotenv.config();
 
 const orchestratorUrl = process.env.ORCH_WS;
 const agentKey = process.env.AGENT_KEY;
+const GRACE_PERIOD_MS = parseInt(process.env.AGENT_GRACE_PERIOD_MS || '10000', 10); // Default 10 seconds
 
 if (!orchestratorUrl || !agentKey) {
   console.error('Error: Missing ORCH_WS or AGENT_KEY environment variables.');
   console.error('Please ensure a .env file exists in the agent directory with these values.');
-  process.exit(1);
+  process.exit(1); // Exit code 1 for configuration error
 }
 
 // Append agent key as query parameter for authentication
@@ -28,6 +32,9 @@ let reconnectTimeoutId: NodeJS.Timeout | null = null;
 let pingIntervalId: NodeJS.Timeout | null = null; // For heartbeat
 const PING_INTERVAL_MS = 30 * 1000; // 30 seconds
 let isClosingGracefully = false; // Flag to prevent reconnect on intentional close
+let isShuttingDown = false; // Flag for graceful shutdown process
+const activeJobs = new Set<string>(); // Track IDs of jobs currently being processed
+let shutdownTimeoutId: NodeJS.Timeout | null = null; // Timer for grace period
 
 // --- Message Interfaces (Example) ---
 interface BaseMessage {
@@ -63,7 +70,20 @@ interface JobRequestMessage extends BaseMessage {
 }
 
 // Add more interfaces for job responses etc. later
-// interface JobResponseMessage extends BaseMessage { action: 'job_response'; data: { jobId: string; statusCode: number; ... } }
+interface JobResponseMessage extends BaseMessage {
+  action: 'job_response';
+  requestId?: string;
+  data: {
+    jobId: string;
+    success: boolean;
+    response?: {
+      statusCode: number;
+      headers: Record<string, string>;
+      body: string; // Base64 encoded
+    };
+    error?: AgentError;
+  };
+}
 
 // Structure for standardized errors
 interface AgentError {
@@ -74,6 +94,10 @@ interface AgentError {
 }
 
 function connect() {
+  if (isShuttingDown) {
+      console.log("Shutdown in progress, connection aborted.");
+      return;
+  }
   if (reconnectTimeoutId) {
     clearTimeout(reconnectTimeoutId);
     reconnectTimeoutId = null;
@@ -89,6 +113,10 @@ function connect() {
   });
 
   ws.on('message', (data) => {
+    if (isShuttingDown) {
+        console.log("Received message during shutdown, ignoring.");
+        return; // Ignore messages during shutdown phase
+    }
     try {
       const message: BaseMessage = JSON.parse(data.toString());
       console.log(`📩 Received action: ${message.action}`);
@@ -99,7 +127,7 @@ function connect() {
           handlePong(message as PongMessage);
           break;
         case 'job_request':
-          handleJobRequest(message as JobRequestMessage);
+          handleJobRequest(message as JobRequestMessage); // Async handling needed
           break;
         default:
           console.warn(`Unknown action received: ${message.action}`);
@@ -115,25 +143,36 @@ function connect() {
     console.log(`❌ Disconnected from Orchestrator. Code: ${code}, Reason: ${reasonString}`);
     stopPing(); // Stop heartbeat on disconnect
     ws = null;
-    if (!isClosingGracefully) {
+    // Reconnect only if not shutting down intentionally (gracefully or due to max attempts)
+    if (!isClosingGracefully && !isShuttingDown && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
         attemptReconnect();
+    } else if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+         console.error(`Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Not attempting further connections.`);
+         // Optionally exit or notify
+         // gracefulShutdown(1); // Consider triggering shutdown if reconnect fails permanently
     }
   });
 
   ws.on('error', (error) => {
     console.error(' WebSocket Error:', error.message);
     stopPing(); // Stop ping on error too
+    // Attempt to close cleanly, the 'close' event will handle reconnect logic
     if (ws && ws.readyState !== WebSocket.CLOSED && ws.readyState !== WebSocket.CLOSING) {
-        ws.close();
+        console.log('Closing WebSocket due to error.');
+        ws.close(1011, "WebSocket Error"); // Use appropriate code if needed
     }
+    // Note: The 'close' event handler should trigger the reconnect logic if appropriate
   });
 }
 
 function attemptReconnect() {
+    if (isShuttingDown) {
+        console.log("Shutdown in progress, reconnect aborted.");
+        return;
+    }
     if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
         console.error(`Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Giving up.`);
-        // Optional: Exit or notify an administrator
-        // process.exit(1);
+        gracefulShutdown(1); // Trigger shutdown if reconnect fails permanently
         return;
     }
 
@@ -156,16 +195,19 @@ function startPing() {
     stopPing(); // Clear existing interval if any
     console.log(`Starting heartbeat ping every ${PING_INTERVAL_MS / 1000}s`);
     pingIntervalId = setInterval(() => {
-        if (ws && ws.readyState === WebSocket.OPEN) {
+        if (ws && ws.readyState === WebSocket.OPEN && !isShuttingDown) {
             const pingMsg: PingMessage = {
                 action: 'ping',
                 timestamp: Date.now(),
                 // requestId: uuidv4() // Add request ID if needed for tracking pongs
             };
             console.log(`	💓 Sending ping...`);
-            ws.send(JSON.stringify(pingMsg));
+            sendMessage(pingMsg); // Use sendMessage for consistency
+        } else if (isShuttingDown) {
+             console.log('Not sending ping, shutdown in progress.');
+             stopPing(); // Stop pinging during shutdown
         } else {
-            console.warn('Cannot send ping, WebSocket not open.');
+            console.warn('Cannot send ping, WebSocket not open or shutting down.');
             // Connection might be closing or already closed, reconnect logic will handle it.
         }
     }, PING_INTERVAL_MS);
@@ -180,13 +222,24 @@ function stopPing() {
 }
 
 function handlePong(message: PongMessage) {
-    console.log(`	💓 Received pong. Round trip latency (if timestamp included): ${message.timestamp ? Date.now() - Number(message.timestamp) : 'N/A'} ms`);
+    // Only log if not shutting down, less noise
+    if (!isShuttingDown) {
+        console.log(`	💓 Received pong. Round trip latency (if timestamp included): ${message.timestamp ? Date.now() - Number(message.timestamp) : 'N/A'} ms`);
+    }
     // Optionally track latency or confirm connection is alive
 }
 
 // --- Job Handling ---
 
-function handleJobRequest(message: JobRequestMessage) {
+// Make handleJobRequest async as executeHttpRequest is async
+async function handleJobRequest(message: JobRequestMessage) {
+    // 1. Check if shutting down
+    if (isShuttingDown) {
+      console.log(`Received job request ${message.data?.jobId} during shutdown, rejecting.`);
+      sendErrorResponse(message.requestId, message.data?.jobId, 'Agent is shutting down', 'AGENT_SHUTTING_DOWN');
+      return;
+    }
+
     console.log(`Received job request for jobId: ${message.data?.jobId || 'N/A'}`);
 
     // --- Robust Validation ---
@@ -198,83 +251,73 @@ function handleJobRequest(message: JobRequestMessage) {
 
     const { jobId, url, method, headers, body, bodyEncoding, timeoutMs } = message.data;
 
-    if (!jobId || typeof jobId !== 'string') {
-        sendErrorResponse(message.requestId, jobId, 'Invalid job request: Missing or invalid jobId', 'AGENT_VALIDATION_ERROR');
-        return;
+    // Basic validation (keep concise for example)
+    if (!jobId || !url || !method) {
+         sendErrorResponse(message.requestId, jobId, 'Invalid job request: Missing required fields (jobId, url, method)', 'AGENT_VALIDATION_ERROR');
+         return;
     }
-    if (!url || typeof url !== 'string') {
-        sendErrorResponse(message.requestId, jobId, 'Invalid job request: Missing or invalid url', 'AGENT_VALIDATION_ERROR');
-        return;
-    }
-    // Basic URL validation (can be enhanced)
-    try {
-        new URL(url);
+     try {
+        new URL(url); // Basic URL format check
     } catch (e) {
         sendErrorResponse(message.requestId, jobId, 'Invalid job request: Malformed URL', 'AGENT_VALIDATION_ERROR');
         return;
     }
-
-    if (!method || typeof method !== 'string' || !['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'].includes(method.toUpperCase())) {
-        sendErrorResponse(message.requestId, jobId, `Invalid job request: Missing or invalid method: ${method}`, 'AGENT_VALIDATION_ERROR');
+     if (!['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'].includes(method.toUpperCase())) {
+        sendErrorResponse(message.requestId, jobId, `Invalid job request: Invalid method: ${method}`, 'AGENT_VALIDATION_ERROR');
         return;
     }
-
-    if (headers && typeof headers !== 'object') {
-        sendErrorResponse(message.requestId, jobId, 'Invalid job request: headers must be an object', 'AGENT_VALIDATION_ERROR');
-        return;
-    }
-
-    if (body && typeof body !== 'string') {
-        sendErrorResponse(message.requestId, jobId, 'Invalid job request: body must be a string (potentially Base64 encoded)', 'AGENT_VALIDATION_ERROR');
-        return;
-    }
-
-    if (bodyEncoding && !['base64', 'utf8'].includes(bodyEncoding)) {
-        sendErrorResponse(message.requestId, jobId, `Invalid job request: invalid bodyEncoding: ${bodyEncoding}. Must be 'base64' or 'utf8'.`, 'AGENT_VALIDATION_ERROR');
-        return;
-    }
-
-    if (timeoutMs && typeof timeoutMs !== 'number') {
-        sendErrorResponse(message.requestId, jobId, 'Invalid job request: timeoutMs must be a number', 'AGENT_VALIDATION_ERROR');
-        return;
-    }
+    // Add other validations as needed...
     // --- End Validation ---
 
-    let requestBody: Buffer | string | undefined = undefined;
-    if (body) {
-        if (bodyEncoding === 'base64') {
-            try {
-                requestBody = Buffer.from(body, 'base64');
-            } catch (e: any) {
-                sendErrorResponse(message.requestId, jobId, `Invalid job request: Failed to decode base64 body: ${e.message}`, 'AGENT_VALIDATION_ERROR');
-                return;
+    // 2. Add job to active set *before* execution
+    activeJobs.add(jobId);
+    console.log(`Job ${jobId} added to active set (${activeJobs.size} active).`);
+
+    try {
+        let requestBody: Buffer | string | undefined = undefined;
+        if (body) {
+            if (bodyEncoding === 'base64') {
+                try {
+                    requestBody = Buffer.from(body, 'base64');
+                } catch (e: any) {
+                    // Cannot return here directly, need to go to finally block to remove from activeJobs
+                    // Throw an error instead to be caught by the outer catch block
+                    throw new Error(`Failed to decode base64 body: ${e.message}`);
+                }
+            } else {
+                requestBody = body; // Assume utf8 if not base64
             }
-        } else { // Default to utf8 if encoding is 'utf8' or not specified
-            requestBody = body;
+        }
+        // Execute the HTTP request
+        await executeHttpRequest(jobId, url, method, headers, requestBody, timeoutMs, message.requestId);
+
+    } catch (error) {
+        // Catch errors *during* the setup/preparation before executeHttpRequest
+        // OR errors thrown deliberately (like the base64 decode failure)
+        console.error(`[${jobId}] Error during job request handling or setup:`, error);
+        // Ensure an error response is sent IF executeHttpRequest wasn't the source of the error
+        // (executeHttpRequest sends its own errors)
+        // Check if the error originated from our setup phase
+        if (!(error instanceof Error && error.message.startsWith('Failed executing HTTP request'))) { // Heuristic check
+             sendErrorResponse(message.requestId, jobId, `Internal agent error during job setup: ${error instanceof Error ? error.message : String(error)}`, 'AGENT_INTERNAL_ERROR', 500);
+        }
+    } finally {
+        // 3. Remove job from active set in finally block
+        activeJobs.delete(jobId);
+        console.log(`Job ${jobId} removed from active set (${activeJobs.size} active).`);
+
+        // 4. Check if shutdown is pending and this was the last job
+        if (isShuttingDown && activeJobs.size === 0) {
+            console.log('Last active job completed during shutdown.');
+            if (shutdownTimeoutId) {
+                clearTimeout(shutdownTimeoutId); // Cancel the force-shutdown timer
+                shutdownTimeoutId = null;
+            }
+            closeConnectionAndExit(0); // Exit cleanly
         }
     }
-
-    // Implement actual HTTP execution
-    console.log(`Executing job ${jobId}: ${method.toUpperCase()} ${url}`);
-    // Use a non-blocking approach
-    executeHttpRequest(
-        jobId,
-        url,
-        method.toUpperCase(),
-        headers,
-        requestBody,
-        timeoutMs,
-        message.requestId
-    ).catch(executionError => {
-        // This catch is a safety net for unexpected errors within executeHttpRequest itself
-        console.error(`[${jobId}] Unexpected error during executeHttpRequest promise:`, executionError);
-        sendErrorResponse(message.requestId, jobId, 'Internal agent error during job execution', 'AGENT_INTERNAL_ERROR');
-    });
 }
 
-/**
- * Executes the HTTP request based on job data.
- */
 async function executeHttpRequest(
     jobId: string,
     url: string,
@@ -284,165 +327,225 @@ async function executeHttpRequest(
     timeoutMs?: number,
     requestId?: string
 ) {
-    const controller = new AbortController();
-    const timeout = timeoutMs || 30000; // Default 30s timeout
-    const timeoutId = setTimeout(() => controller.abort(), timeout);
+    console.log(`[${jobId}] Executing ${method} request to ${url}`);
+    const effectiveTimeout = timeoutMs || 30000; // Default 30s timeout
 
     try {
-        console.log(`[${jobId}] Sending request to ${url} with timeout ${timeout}ms`);
-        const res = await request(url, {
-            method: method,
-            headers: headers,
+        const { statusCode, headers: responseHeaders, body: responseBodyStream } = await request(url, {
+            method: method.toUpperCase(),
+            headers: {
+                ...headers, // Spread incoming headers
+                'User-Agent': `DistributedAgent/1.0 (JobId: ${jobId})`, // Example User-Agent
+            },
             body: body,
-            signal: controller.signal,
-            // TODO: Add redirect handling if needed: follow: 5
+            bodyTimeout: effectiveTimeout, // Timeout for receiving the body
+            headersTimeout: effectiveTimeout, // Timeout for receiving headers
+            // connectTimeout: 10000, // Removed as it's not standard
+            // Allow throwing errors for non-2xx status codes for simpler handling below
+            // throwOnError: true, // Consider if this simplifies error logic vs checking statusCode
         });
-        clearTimeout(timeoutId);
 
-        console.log(`[${jobId}] Received response: ${res.statusCode}`);
+        console.log(`[${jobId}] Received response: ${statusCode}`);
 
-        // Read response body
-        const responseBodyBuffer = Buffer.from(await res.body.arrayBuffer());
+        // Consume the stream and collect into a buffer
+        const chunks: Buffer[] = []; // Explicitly type chunks as Buffer[]
+        for await (const chunk of responseBodyStream) {
+            chunks.push(chunk);
+        }
+        const completeBodyBuffer = Buffer.concat(chunks);
 
-        // Handle non-2xx status codes as errors
-        if (res.statusCode < 200 || res.statusCode >= 300) {
-            console.warn(`[${jobId}] Target server returned non-2xx status: ${res.statusCode}`);
-            let errorDetails: any = responseBodyBuffer.toString('utf8'); // Attempt to parse body as text
-            try {
-                 // Try parsing as JSON if content-type suggests it
-                 if (res.headers['content-type']?.includes('application/json')) {
-                    errorDetails = JSON.parse(errorDetails);
-                 }
-            } catch (parseError) {
-                 // Ignore if body is not valid JSON
-                 console.log(`[${jobId}] Response body for error status ${res.statusCode} is not JSON.`);
-            }
-            sendErrorResponse(
-                requestId,
-                jobId,
-                `Target server responded with status ${res.statusCode}`,
-                'AGENT_TARGET_ERROR',
-                res.statusCode,
-                { responseBody: errorDetails } // Include response body in details
-            );
-            return; // Stop processing on error
+        // Convert headers object (IncomingHttpHeaders) to simple Record<string, string>
+        const simpleHeaders: Record<string, string> = {};
+        for (const [key, value] of Object.entries(responseHeaders)) {
+           if (value !== undefined) {
+             // Handle single string value, array of strings, or undefined
+             simpleHeaders[key] = Array.isArray(value) ? value.join(', ') : String(value);
+           }
         }
 
-        // Success: Send response back to orchestrator
-        sendSuccessResponse(
-            requestId,
-            jobId,
-            res.statusCode,
-            res.headers as Record<string, string>, // Cast might be needed
-            responseBodyBuffer
-        );
+        // Send success (even for non-2xx status codes from the target)
+        sendSuccessResponse(requestId, jobId, statusCode, simpleHeaders, completeBodyBuffer);
 
     } catch (error: any) {
-        clearTimeout(timeoutId);
         console.error(`[${jobId}] Error executing HTTP request:`, error);
 
-        let errorCode = 'AGENT_UNKNOWN_ERROR';
-        let errorMessage = error.message || 'Unknown error executing request';
-        let statusCode: number | undefined = undefined;
+        // Wrap error message for clarity in finally block check
+        const errorMessagePrefix = 'Failed executing HTTP request: ';
+        let errorCode = 'AGENT_REQUEST_FAILED';
+        let message = `${errorMessagePrefix}Unknown error`;
+        let statusCode: number | undefined = undefined; // HTTP status from error if available
 
-        if (error.name === 'AbortError' || error.code === 'UND_ERR_ABORTED') {
-            errorCode = 'AGENT_TIMEOUT';
-            errorMessage = `Request timed out after ${timeout}ms`;
-        } else if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED' || error.code === 'ECONNRESET') {
-            errorCode = 'AGENT_NETWORK_ERROR';
-            errorMessage = `Network error: ${error.code || error.message}`;
-        } else if (error.statusCode) {
-             // Sometimes undici might throw errors with status codes (e.g., invalid URL?)
-             errorCode = 'AGENT_REQUEST_ERROR';
-             statusCode = error.statusCode;
+        if (error && typeof error === 'object') {
+             // undici specific errors often have codes
+            if ('code' in error) {
+                message = `${errorMessagePrefix}${error.code} - ${error.message}`;
+                if (error.code === 'UND_ERR_CONNECT_TIMEOUT') { // Note: connectTimeout is implicit in headersTimeout usually
+                    errorCode = 'AGENT_CONNECT_TIMEOUT';
+                } else if (error.code === 'UND_ERR_HEADERS_TIMEOUT' || error.code === 'UND_ERR_BODY_TIMEOUT') {
+                    errorCode = 'AGENT_TARGET_TIMEOUT';
+                } else if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED' || error.code === 'ECONNRESET') {
+                     errorCode = 'AGENT_TARGET_UNREACHABLE';
+                } // Add more specific undici error codes if needed
+            } else {
+                 message = `${errorMessagePrefix}${error.message || 'Unknown error'}`;
+            }
+             // Check if it resembles an HTTP error structure from undici or target
+            if ('statusCode' in error && typeof error.statusCode === 'number') {
+                statusCode = error.statusCode;
+                errorCode = 'AGENT_TARGET_ERROR'; // Consider it a target error if status code present
+                message = `${errorMessagePrefix}Target responded with status ${statusCode}`;
+            } else if ('response' in error && error.response && 'statusCode' in error.response && typeof error.response.statusCode === 'number') {
+                // Handle cases where undici wraps the response in error
+                statusCode = error.response.statusCode;
+                errorCode = 'AGENT_TARGET_ERROR';
+                message = `${errorMessagePrefix}Target responded with status ${statusCode}`;
+            }
+        } else {
+            message = `${errorMessagePrefix}${String(error)}`;
         }
-        // Add more specific error code mappings as needed
 
-        sendErrorResponse(requestId, jobId, errorMessage, errorCode, statusCode);
+        // Cast error to unknown when passing as details
+        sendErrorResponse(requestId, jobId, message, errorCode, statusCode, error as unknown);
+        // Explicitly create and type the error object before throwing
+        const executionError: Error = new Error(String(message));
+        throw executionError;
     }
 }
 
-/**
- * Sends a successful job response back to the Orchestrator.
- */
 function sendSuccessResponse(requestId: string | undefined, jobId: string, statusCode: number, headers: Record<string, string>, body: Buffer) {
-    // Base64 encode body for safe JSON transport
-    const bodyBase64 = body.toString('base64');
-    const isBase64Encoded = true; // Always encode for simplicity, receiver can decode
-
-    const responseMessage = {
+    const response: JobResponseMessage = {
         action: 'job_response',
-        requestId: requestId, // Include original request ID if available
+        requestId: requestId, // Include original requestId if present
+        timestamp: Date.now(),
         data: {
             jobId: jobId,
-            status: 'success',
-            result: {
+            success: true,
+            response: {
                 statusCode: statusCode,
                 headers: headers,
-                body: bodyBase64,
-                isBase64Encoded: isBase64Encoded,
-            },
-        },
+                body: body.toString('base64') // Always encode body as Base64
+            }
+        }
     };
-    console.log(`[${jobId}] Sending success response.`);
-    sendMessage(responseMessage);
+    sendMessage(response);
+    console.log(`[${jobId}] Success response sent (Target Status: ${statusCode}).`);
 }
 
-/**
- * Sends an error job response back to the Orchestrator.
- */
 function sendErrorResponse(requestId: string | undefined, jobId: string | undefined, message: string, errorCode: string, statusCode?: number, details?: any) {
-    console.error(`[${jobId || 'N/A'}] Sending error response: Code=${errorCode}, Msg=${message}`);
-    const errorPayload: AgentError = {
-        code: errorCode,
-        message: message,
-        statusCode: statusCode,
-        details: details,
-    };
-    const responseMessage = {
+     // Ensure jobId is included if available, even if it's just from the initial request
+    const effectiveJobId = jobId || (requestId ? `unknown_job_for_${requestId}` : 'unknown_job');
+
+    const errorResponse: JobResponseMessage = {
         action: 'job_response',
         requestId: requestId,
+        timestamp: Date.now(),
         data: {
-            jobId: jobId || 'unknown', // Include jobId if known
-            status: 'failure',
-            error: errorPayload,
-        },
+            jobId: effectiveJobId,
+            success: false,
+            error: {
+                code: errorCode,
+                message: message,
+                statusCode: statusCode, // Include original status if available (e.g., 404 from target)
+                details: details ? JSON.stringify(details) : undefined // Add extra context if needed
+            }
+        }
     };
-    sendMessage(responseMessage);
+    sendMessage(errorResponse);
+     console.error(`[${effectiveJobId}] Error response sent: ${errorCode} - ${message}`);
 }
 
-// Utility to send messages
 function sendMessage(message: BaseMessage) {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        try {
-            const messageString = JSON.stringify(message);
-            console.log(`	🚀 Sending message: ${message.action}`);
-            ws.send(messageString);
-        } catch (err: any) { // Use 'any' or a more specific error type
-            console.error('Error stringifying or sending message:', err.message);
-        }
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try {
+      ws.send(JSON.stringify(message));
+    } catch (error) {
+      console.error('Error sending message:', error);
+      // Attempt to close connection if send fails, reconnect logic will handle it
+       if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.close(1011, "Send Error");
+       }
+    }
+  } else {
+    console.warn(`Cannot send message (Action: ${message.action}), WebSocket not open.`);
+    // Don't attempt reconnect here, let the close/error handlers manage it
+  }
+}
+
+// --- Graceful Shutdown Logic ---
+function gracefulShutdown(exitCode: number = 0) {
+    if (isShuttingDown) {
+        console.log('Shutdown already in progress.');
+        return; // Prevent redundant shutdown calls
+    }
+    isShuttingDown = true;
+    console.log(`🚨 Initiating graceful shutdown (Exit code: ${exitCode})...`);
+    stopPing(); // Stop sending pings
+
+    if (reconnectTimeoutId) {
+        clearTimeout(reconnectTimeoutId); // Cancel any pending reconnect
+        reconnectTimeoutId = null;
+    }
+
+    if (activeJobs.size === 0) {
+        console.log('No active jobs. Shutting down immediately.');
+        closeConnectionAndExit(exitCode);
     } else {
-        console.error(`Cannot send message, WebSocket not open or not initialized. Action: ${message.action}`);
+        console.log(`Waiting for ${activeJobs.size} active job(s) to complete (max ${GRACE_PERIOD_MS / 1000}s)...`);
+        console.log('Active job IDs:', Array.from(activeJobs));
+
+        // Set a timer to force exit if jobs don't finish
+        shutdownTimeoutId = setTimeout(() => {
+            console.warn(`Grace period (${GRACE_PERIOD_MS / 1000}s) expired. Forcing shutdown.`);
+            console.warn(`Jobs still active: ${Array.from(activeJobs).join(', ')}`);
+            closeConnectionAndExit(1); // Use non-zero exit code for forced shutdown
+        }, GRACE_PERIOD_MS);
     }
 }
 
-// Initial connection attempt
+function closeConnectionAndExit(exitCode: number) {
+     console.log(`Closing WebSocket connection and exiting with code ${exitCode}...`);
+     isClosingGracefully = true; // Prevent reconnect attempts from the 'close' handler
+     if (shutdownTimeoutId) { // Clear timeout if we are exiting before it fires
+        clearTimeout(shutdownTimeoutId);
+        shutdownTimeoutId = null;
+     }
+
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.close(1000, 'Graceful shutdown'); // 1000 is normal closure
+    } else if (ws && ws.readyState === WebSocket.CONNECTING) {
+         ws.terminate(); // Force close if still connecting
+    }
+     // Add a small delay to allow the close frame to potentially be sent
+    setTimeout(() => {
+        console.log("Exiting process.");
+        process.exit(exitCode);
+    }, 250); // Delay exit slightly
+}
+
+// --- Signal Handling ---
+process.on('SIGINT', () => {
+    console.log('Received SIGINT (Ctrl+C).');
+    gracefulShutdown(0); // Treat SIGINT as a request for graceful exit (code 0)
+});
+
+process.on('SIGTERM', () => {
+    console.log('Received SIGTERM.');
+    gracefulShutdown(0); // Treat SIGTERM as a request for graceful exit (code 0)
+});
+
+process.on('uncaughtException', (error) => {
+    console.error('🚨 Uncaught Exception:', error);
+    // Attempt a last-ditch graceful shutdown, might not always work
+    gracefulShutdown(1); // Use non-zero exit code for unexpected errors
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('🚨 Unhandled Rejection at:', promise, 'reason:', reason);
+     // Attempt a last-ditch graceful shutdown
+    gracefulShutdown(1);
+});
+
+// --- Initial Connection ---
 connect();
 
-// Keep the agent running (optional, depends on deployment strategy)
-// process.stdin.resume(); // Keep node process alive
-
-// Handle graceful shutdown
-process.on('SIGINT', () => {
-  console.log('SIGINT received. Closing connection gracefully...');
-  isClosingGracefully = true; // Set flag to prevent reconnection
-  stopPing(); // Stop ping on shutdown
-  if (reconnectTimeoutId) {
-      clearTimeout(reconnectTimeoutId); // Cancel any pending reconnect
-  }
-  if (ws) {
-    ws.close(1000, 'Agent shutting down'); // Close with a normal code
-  }
-  // Allow time for close event to process before exiting
-  setTimeout(() => process.exit(0), 500);
-});
+console.log("Agent process started. Waiting for connection...");
