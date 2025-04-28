@@ -1,0 +1,8 @@
+{
+  "OrchestratorStackV2": {
+    "ApiGatewayLogsRoleArn": "arn:aws:iam::585576670327:role/OrchestratorStackV2-ApiGatewayLogsRoleA66F4CEE-6Tm97ru2GPZa",
+    "WebSocketApiId": "g0u8826061",
+    "WebSocketAccessLogGroup": "/aws/apigateway/g0u8826061/dev/access",
+    "WebSocketApiEndpoint": "wss://g0u8826061.execute-api.us-west-2.amazonaws.com/dev"
+  }
+}

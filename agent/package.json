@@ -11,7 +11,9 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@aws-sdk/util-dynamodb": "^3.798.0",
     "dotenv": "^16.4.5",
+    "undici": "^7.8.0",
     "ws": "^8.17.1"
   },
   "devDependencies": {

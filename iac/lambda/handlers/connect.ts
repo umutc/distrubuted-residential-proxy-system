@@ -1,12 +1,14 @@
 import { DynamoDBClient, PutItemCommand } from '@aws-sdk/client-dynamodb';
 import { APIGatewayProxyWebsocketEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
+import { AgentInfo } from '../utils/types';
 
 const dynamoDBClient = new DynamoDBClient({});
 const tableName = process.env.AGENT_REGISTRY_TABLE_NAME;
 
 export const handler = async (event: APIGatewayProxyWebsocketEventV2): Promise<APIGatewayProxyResultV2> => {
     const connectionId = event.requestContext.connectionId;
-    console.log(`Connect event received for connection ID: ${connectionId}`);
+    const connectTime = new Date().toISOString();
+    console.log(`Connect event received for connection ID: ${connectionId} at ${connectTime}`);
 
     if (!tableName) {
         console.error('AGENT_REGISTRY_TABLE_NAME environment variable not set.');
@@ -17,8 +19,10 @@ export const handler = async (event: APIGatewayProxyWebsocketEventV2): Promise<A
         TableName: tableName,
         Item: {
             connectionId: { S: connectionId },
-            // Add other relevant info if needed, e.g., connect time
-            connectedAt: { S: new Date().toISOString() }
+            connectedAt: { S: connectTime },
+            status: { S: 'connected' }, // Initial status
+            // Add TTL attribute (e.g., 24 hours from now)
+            ttl: { N: String(Math.floor(Date.now() / 1000) + 24 * 60 * 60) }
         },
     };
 
