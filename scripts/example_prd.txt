@@ -1,0 +1,158 @@
+# Product Requirements Document: Distributed Residential Proxy System
+
+**Version:** 1.1
+**Date:** April 28, 2025
+**Author:** Gemini
+**Status:** Draft
+
+## 1. Overview
+
+The **Distributed Residential Proxy System** provides a mechanism for internal cloud services (e.g., AWS Lambda functions) to execute outbound HTTP(S) requests via a pool of geographically diverse residential IP addresses. It solves the problem of services being rate-limited, blocked, or needing to simulate user access from specific regions when using standard datacenter IPs.
+
+The system is valuable for development teams performing web scraping, ad verification, application testing, and other tasks requiring authentic residential IP footprints. It consists of two main components:
+* **Orchestrator:** A central, cloud-hosted service (likely on AWS) that manages agents and distributes request jobs.
+* **Agent:** A lightweight Node.js application run by developers or designated users on their home computers (connected to residential internet), which executes the requests.
+
+The primary goals are to leverage residential IPs effectively, provide a simple and secure agent management system, minimize agent setup complexity, ensure secure data transmission, and offer basic monitoring.
+
+## 2. Core Features
+
+**2.1. Agent Connection & Authentication**
+* **What it does:** Allows Agent applications to securely connect and identify themselves to the Orchestrator.
+* **Why it's important:** Establishes the secure communication channel and ensures only authorized agents participate in the pool.
+* **How it works:** Agents initiate a secure WebSocket (WSS) connection to the Orchestrator. On connection, the Agent sends a unique API key (`AGENT_KEY`) for authentication. The Orchestrator validates the key before accepting the connection. Agents automatically attempt reconnection on disconnects. (FR-Agent-1, FR-Agent-2, FR-Orch-1, NFR-Sec-1, NFR-Sec-2, NFR-Rel-1)
+
+**2.2. Job Distribution & Execution**
+* **What it does:** Enables the Orchestrator to receive HTTP request jobs from internal services and assign them to available Agents for execution.
+* **Why it's important:** This is the core proxying mechanism, routing requests through the desired residential IPs.
+* **How it works:** Internal services submit job details (URL, method, headers, body) to the Orchestrator's ingestion interface (e.g., API). The Orchestrator assigns a job ID, selects an available Agent (e.g., round-robin), marks it busy, and sends the job details over the WebSocket. The Agent receives the job, executes the HTTP(S) request locally (following redirects), using its home internet connection. (FR-Agent-3, FR-Agent-4, FR-Orch-2, FR-Orch-3)
+
+**2.3. Response Handling**
+* **What it does:** Facilitates the return of HTTP response data (or errors) from the Agent back to the originating internal service via the Orchestrator.
+* **Why it's important:** Completes the request cycle, providing the results needed by the internal service.
+* **How it works:** After execution, the Agent sends a message containing the job ID, status code, headers, and Base64-encoded body (or an error message) back to the Orchestrator via WebSocket. The Orchestrator matches the response to the original job, marks the Agent as available, and forwards the response data back to the originator. (FR-Agent-5, FR-Orch-4)
+
+**2.4. Agent Management & Monitoring**
+* **What it does:** Allows the Orchestrator to track connected agents and provides basic visibility into the pool's status.
+* **Why it's important:** Essential for understanding pool capacity and basic troubleshooting.
+* **How it works:** The Orchestrator maintains an internal registry of connected, authenticated agents and their status (available/busy). It provides a basic monitoring interface (e.g., API endpoint) to list connected agents. (FR-Orch-1, FR-Orch-6)
+
+**2.5. Timeout Handling**
+* **What it does:** Prevents jobs from hanging indefinitely if an agent fails to respond.
+* **Why it's important:** Ensures system stability and timely feedback to the requesting service.
+* **How it works:** The Orchestrator implements a configurable timeout for jobs sent to agents. If no response arrives within the timeout, the job is marked failed, and an error is returned. (FR-Orch-5)
+
+**2.6. Agent Configuration**
+* **What it does:** Allows easy configuration of the Agent application.
+* **Why it's important:** Simplifies deployment and setup for users running the agent.
+* **How it works:** The Agent reads its configuration (Orchestrator URL, API Key) from environment variables. (FR-Agent-6, NFR-Main-1)
+
+## 3. User Experience
+
+* **User Personas:**
+    * **Agent Operator:** Developers or designated users who run the Agent software on their home computers. They need a simple setup process (run script, set environment variables).
+    * **Service Developer:** Developers integrating their internal AWS services (e.g., Lambda) with the proxy system. They need a clear API or mechanism to submit jobs to the Orchestrator and receive results.
+* **Key User Flows:**
+    * **Agent Setup:** Operator downloads/receives the Agent script, obtains an API key, sets environment variables (`ORCH_WS`, `AGENT_KEY`), runs the script. Agent connects and becomes available.
+    * **Job Submission (Service Developer):** Developer's service constructs the request details, calls the Orchestrator's ingestion API/interface, and awaits the response (synchronously or asynchronously).
+    * **Monitoring:** Admin or Service Developer queries the Orchestrator's monitoring endpoint to see connected agents.
+* **UI/UX Considerations:**
+    * **Agent:** Primarily a command-line application. Logs should clearly indicate connection status, jobs processed, and errors. (NFR-Log-1)
+    * **Orchestrator:** No direct end-user UI planned for V1. Interaction is via APIs. Future versions might include a dashboard (See Sec 7).
+
+## 4. Technical Architecture
+
+* **System Components:**
+    * **Agent:** Node.js application using `ws` for WebSockets and `undici` (or `node-fetch`) for HTTP requests. Runs on operator's machine (Windows, macOS, Linux).
+    * **Orchestrator:** Cloud-based application hosted on AWS.
+        * *Compute:* AWS ECS (Fargate recommended), EC2, or App Runner.
+        * *WebSocket Management:* AWS API Gateway (WebSocket API) strongly recommended for scalability and simplified backend integration. Alternatively, manage connections directly on compute instances behind an ALB.
+        * *Job Ingestion Interface:* AWS API Gateway (HTTP API) or potentially an SQS queue.
+        * *State Management:* In-memory (for single instance/sticky sessions) or external store (Redis/DynamoDB) for agent registry and status if scaling horizontally.
+* **Data Models:**
+    * **Agent Registry:** (Transient) Agent ID, Connection ID/Reference, Status (Available/Busy).
+    * **Job:** Job ID, URL, Method, Headers (optional), Body (optional), Status (Pending/Sent/Completed/Failed), Timestamp.
+    * **Response:** Job ID, Status Code, Headers, Body (Base64), Error Message (optional).
+    * **Configuration:** List of valid Agent API Keys (securely stored, e.g., Secrets Manager).
+* **APIs and Integrations:**
+    * **Agent <-> Orchestrator:** Secure WebSocket (WSS) protocol. Messages are JSON strings.
+    * **Internal Service -> Orchestrator:** Internal HTTP API (e.g., via API Gateway) or message queue (SQS).
+* **Infrastructure Requirements:**
+    * AWS Account.
+    * Compute resources for Orchestrator (ECS/EC2/App Runner).
+    * API Gateway (WebSocket and potentially HTTP).
+    * Optional: SQS, Redis/DynamoDB, Secrets Manager.
+    * Logging/Monitoring: CloudWatch Logs.
+    * Operator machines capable of running Node.js.
+
+## 5. Development Roadmap
+
+**5.1. MVP Requirements (Phase 1)**
+* **Foundation:**
+    * Basic Orchestrator service setup (e.g., ECS Fargate Task Definition).
+    * Implement WebSocket server (e.g., using API Gateway WebSocket API + Lambda integration).
+    * Implement basic Agent connection handling and authentication (API key in query string).
+    * Implement secure storage and retrieval for Agent API keys.
+    * Basic Agent registry (in-memory initially if using Lambda/single instance).
+* **Core Proxy Flow:**
+    * Develop the Node.js Agent script capable of connecting, authenticating, receiving jobs, executing `fetch`, and sending back responses/errors via WebSocket.
+    * Implement Orchestrator logic to receive a job via a simple synchronous HTTP API endpoint (API Gateway -> Lambda/ECS).
+    * Implement Orchestrator logic to select an available agent (simple round-robin/random) and send the job.
+    * Implement Orchestrator logic to receive the response from the Agent.
+    * Implement Orchestrator logic to return the response synchronously via the HTTP API endpoint.
+    * Implement basic job timeout mechanism in the Orchestrator.
+* **Essentials:**
+    * Agent configuration via environment variables (`ORCH_WS`, `AGENT_KEY`).
+    * Basic CloudWatch logging on Orchestrator and console logging on Agent.
+    * Support for GET and POST requests with Base64 body handling.
+    * Ensure WSS is used.
+
+**5.2. Future Enhancements (Post-MVP Phases)**
+* **Robust Job Handling:** Implement SQS for job ingestion; implement asynchronous response handling (callbacks, webhooks, status polling API).
+* **Scalability & Reliability:** Implement external state management (Redis/DynamoDB) for agent registry if scaling Orchestrator horizontally; refine agent reconnection logic.
+* **Advanced Agent Management:** Implement proactive health checks from Orchestrator; add geographic information to agent registry; implement more sophisticated agent selection strategies.
+* **Monitoring & Observability:** Develop a monitoring dashboard UI; add detailed metrics (job throughput, latency, error rates).
+* **Features:** Support for job prioritization; bandwidth/rate limiting controls; agent auto-update mechanism.
+* **Security:** Enhance authentication (e.g., JWT).
+
+## 6. Logical Dependency Chain
+
+1.  **Orchestrator WebSocket Endpoint:** Set up the basic WebSocket server (API Gateway + backend compute) capable of accepting connections. Define the WSS URL (`ORCH_WS`).
+2.  **Agent Connection & Auth:** Develop the Agent script to connect to the endpoint and authenticate using a hardcoded/env var key (`AGENT_KEY`). Implement key validation and basic agent registration (in-memory) on the Orchestrator. *Goal: Agent connects successfully.*
+3.  **Basic Job Send (Orch -> Agent):** Implement Orchestrator logic to send a hardcoded/simple job JSON message to a connected Agent. Implement Agent logic to receive and log the message. *Goal: Agent receives a job.*
+4.  **Job Execution & Response (Agent -> Orch):** Implement Agent `fetch` logic and response formatting (including Base64 body). Implement Agent logic to send the response back. Implement Orchestrator logic to receive and log the response. *Goal: Orchestrator receives a response from Agent.*
+5.  **Job Ingestion API:** Create the internal HTTP API endpoint on the Orchestrator to receive job details from internal services.
+6.  **End-to-End Flow (Sync):** Connect the Job Ingestion API to the job distribution logic. Implement agent selection (simple). Implement logic to wait for the Agent response and return it synchronously via the API. Implement basic timeout. *Goal: Internal service can call API, get response proxied via Agent.*
+7.  **Configuration & Logging:** Finalize environment variable handling in Agent; implement structured logging in both components.
+8.  **Refinement:** Add reconnection logic, error handling improvements, basic monitoring endpoint.
+
+## 7. Risks and Mitigations
+
+* **Risk:** Agents frequently disconnect due to unreliable home internet.
+    * **Mitigation:** Implement robust reconnection logic with backoff in the Agent. Orchestrator must handle agent unavailability gracefully (timeouts, selecting other agents). Monitor connection stability.
+* **Risk:** Security vulnerabilities (unauthorized agent access, insecure key management, insecure WebSocket).
+    * **Mitigation:** Enforce WSS. Implement strong API key authentication. Store keys securely (e.g., AWS Secrets Manager). Regularly review security practices. Consider JWT for future enhancement.
+* **Risk:** Orchestrator becomes a bottleneck (connection limits, processing limits).
+    * **Mitigation:** Use scalable AWS services (API Gateway WebSocket API, Fargate/Lambda). Design for horizontal scaling. Monitor performance metrics.
+* **Risk:** Agents misuse the service or execute malicious requests.
+    * **Mitigation:** V1 relies on trusted operators. Future: Implement monitoring, rate limiting, potentially URL blocklists on the Orchestrator side. Clear usage policies.
+* **Risk:** Difficulty managing Agent API keys securely.
+    * **Mitigation:** Use AWS Secrets Manager or similar for Orchestrator storage. Establish a secure process for provisioning keys to Agent Operators.
+* **Risk:** Defining the right MVP scope.
+    * **Mitigation:** Focus strictly on the core proxy flow first (sync API, basic agent selection) as outlined in the roadmap and dependency chain. Defer advanced features.
+* **Risk:** Latency introduced by WebSocket hops and serialization.
+    * **Mitigation:** Monitor end-to-end latency. Optimize message sizes. Ensure efficient processing in Orchestrator and Agent. Accept that some overhead is inherent. (NFR-Perf-1)
+
+## 8. Appendix
+
+* **Open Questions (from v1.0):**
+    * Target number of concurrent agents for V1?
+    * Target job throughput (requests/sec) for V1?
+    * Acceptable job processing timeout for V1?
+    * Specific AWS services selection confirmation (API GW, Fargate/Lambda, Redis/DynamoDB?).
+    * Detailed Agent API key provisioning/management process?
+    * Detailed error handling codes/strategy?
+    * Exact API specification for the internal job submission interface?
+* **Potential Libraries:**
+    * Agent: `ws`, `undici` / `node-fetch`
+    * Orchestrator (Node.js): `ws`, `aws-sdk`, potentially framework like Express/Fastify if building custom server.
