@@ -4,6 +4,37 @@ A system designed for managing and utilizing a pool of geographically diverse re
 
 This project is managed using [Task Master](README-task-master.md) for AI-driven development.
 
+## 🚀 Project Status
+
+[![Project Status](https://img.shields.io/badge/status-MVP%20Development-blue)](https://github.com/umutc/distrubuted-residential-proxy-system)
+
+> The project is currently focused on building the Minimum Viable Product (MVP) features outlined in the PRD.
+
+## ⏳ Timeline
+
+-   **Current Phase:** MVP Implementation (See Tasks 1-10)
+-   **Focus:** Core functionality for agent connection, job proxying (sync), and basic management.
+-   **Next Steps (Post-MVP):** Asynchronous job handling, enhanced monitoring, scalability improvements (See PRD Section 5.2).
+
+## 📊 Progress
+
+**Overall MVP Completion: 0%**
+
+```
+[░░░░░░░░░░░░░░░░░░░░] 0% 
+```
+*(Based on Task Master task statuses)*
+
+-   **Completed Milestones:**
+    -   ✅ Project Setup & Git Initialization
+    -   ✅ Initial Task Generation from PRD
+-   **Current Priorities:**
+    -   ⏱️ Task 1: Set up Orchestrator WebSocket infrastructure
+    -   ⏱️ Task 2: Implement Agent authentication and registration
+    -   ⏱️ Task 3: Develop basic Agent application
+
+---
+
 ## Core Features (MVP)
 
 -   **Agent Connection & Authentication:** Lightweight Node.js agents running on operator machines connect securely to a central Orchestrator via WebSocket (WSS) using API keys. Includes reconnection logic.
