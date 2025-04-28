@@ -19,6 +19,8 @@ import { HttpLambdaIntegration } from '@aws-cdk/aws-apigatewayv2-integrations-al
 // Use this for Account-level settings like CloudWatch role
 import * as apigw_classic from 'aws-cdk-lib/aws-apigateway';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
+import { SqsEventSource } from 'aws-cdk-lib/aws-lambda-event-sources'; // Import for SQS trigger
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch'; // Import cloudwatch for metrics permissions
 
 // Placeholder Lambda ARN (replace in later tasks)
 const PLACEHOLDER_LAMBDA_URI = 'arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:123456789012:function:placeholderFunction/invocations';
@@ -240,6 +242,7 @@ export class OrchestratorStack extends cdk.Stack {
         AGENT_REGISTRY_TABLE_NAME: agentRegistryTable.tableName,
         WEBSOCKET_API_ENDPOINT: stage.url, // Pass WebSocket URL to the handler
         ORCHESTRATOR_QUEUE_URL: orchestratorInputQueue.queueUrl, // <-- Add Orchestrator Queue URL
+        SYNC_JOB_MAPPING_TABLE_NAME: syncJobMappingTable.tableName, // <-- Add Sync Map Table Name
         // JOB_REPOSITORY_TABLE_NAME: jobRepositoryTable.tableName, // Add when table is enabled
       },
     });
@@ -249,25 +252,43 @@ export class OrchestratorStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
-    // --- Orchestrator Job Dispatcher Lambda ---
+    // Grant JobIngestionHandler SQS permissions for temporary queues
+    const sqsJobIngestionPermissionStatement = new iam.PolicyStatement({
+      actions: [
+        'sqs:CreateQueue',
+        'sqs:DeleteQueue',
+        'sqs:ReceiveMessage',
+        'sqs:DeleteMessage',
+        'sqs:GetQueueAttributes', // Needed for CreateQueue response
+        'sqs:TagQueue', // Used in handler to tag queue
+      ],
+      // Restrict resource pattern if possible, e.g., based on naming convention
+      resources: [`arn:aws:sqs:${this.region}:${this.account}:job-response-*`],
+    });
+    jobIngestionHandler.addToRolePolicy(sqsJobIngestionPermissionStatement);
+    // Grant permission to send to orchestrator queue
+    orchestratorInputQueue.grantSendMessages(jobIngestionHandler);
+    // Grant permission to publish CloudWatch metrics
+    jobIngestionHandler.addToRolePolicy(new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: ['cloudwatch:PutMetricData'],
+        // It's recommended to scope this down if possible, but '*' is common for PutMetricData
+        // Condition: { StringEquals: { "cloudwatch:namespace": "YourAppNamespace" } } // Optional: Restrict namespace
+        resources: ['*'],
+    }));
+
+    // Define Orchestrator Dispatcher Lambda
     const orchestratorDispatcherHandler = new lambda_nodejs.NodejsFunction(this, 'OrchestratorDispatcherHandler', {
         entry: path.join(__dirname, '../lambda/handlers/orchestrator-dispatcher.ts'),
         handler: 'handler',
         runtime: lambda.Runtime.NODEJS_LATEST,
-        // Create a new role or reuse webSocketHandlerRole and add permissions
-        role: webSocketHandlerRole, // Reusing role, ensure permissions are added below
+        role: webSocketHandlerRole, // Reuse role for base permissions
         environment: {
             AGENT_REGISTRY_TABLE_NAME: agentRegistryTable.tableName,
             SYNC_JOB_MAPPING_TABLE_NAME: syncJobMappingTable.tableName,
-            WEBSOCKET_API_ENDPOINT: stage.url, // Pass WebSocket URL (wss://...)
+            WEBSOCKET_API_ENDPOINT: stage.url, // Pass WebSocket URL
         },
-        timeout: cdk.Duration.seconds(30), // Adjust as needed
-    });
-    // Add SQS Event Source Mapping
-    orchestratorDispatcherHandler.addEventSourceMapping('OrchestratorInputQueueSource', {
-        eventSourceArn: orchestratorInputQueue.queueArn,
-        batchSize: 5, // Adjust batch size as needed
-        // reportBatchItemFailures: true, // Enable partial batch failure reporting if handler supports it
+        timeout: cdk.Duration.seconds(30), // Allow reasonable time for processing + API calls
     });
     new logs.LogGroup(this, 'OrchestratorDispatcherLogGroup', {
         logGroupName: `/aws/lambda/${orchestratorDispatcherHandler.functionName}`,
@@ -275,117 +296,95 @@ export class OrchestratorStack extends cdk.Stack {
         removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
-    // --- Grant Permissions ---
-    agentApiKeysSecret.grantRead(connectHandler); // Grant connect Lambda permission to read the secret
+    // Add SQS event source trigger
+    orchestratorDispatcherHandler.addEventSource(new SqsEventSource(orchestratorInputQueue, {
+        batchSize: 5, // Process up to 5 messages per invocation
+        // reportBatchItemFailures: true, // Enable partial batch failure reporting if needed
+    }));
+
+    // Grant OrchestratorDispatcher specific permissions
+    agentRegistryTable.grantReadWriteData(orchestratorDispatcherHandler); // Find agent, mark busy
+    syncJobMappingTable.grantReadWriteData(orchestratorDispatcherHandler); // Store sync mapping
+    // Permissions to post to WebSocket connections are already in webSocketHandlerRole
+
+    // --- Health Check Lambda ---
+    const healthCheckHandler = new lambda_nodejs.NodejsFunction(this, 'HealthCheckHandler', {
+        entry: path.join(__dirname, '../lambda/handlers/health-check.ts'),
+        handler: 'handler',
+        runtime: lambda.Runtime.NODEJS_LATEST,
+        environment: {
+            AGENT_REGISTRY_TABLE_NAME: agentRegistryTable.tableName,
+            SYNC_JOB_MAPPING_TABLE_NAME: syncJobMappingTable.tableName,
+        },
+        // Consider a separate, more restricted role for health checks
+        role: new iam.Role(this, 'HealthCheckHandlerRole', {
+            assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
+            managedPolicies: [
+                iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole'),
+            ],
+        }),
+    });
+    new logs.LogGroup(this, 'HealthCheckHandlerLogGroup', {
+      logGroupName: `/aws/lambda/${healthCheckHandler.functionName}`,
+      retention: logs.RetentionDays.ONE_WEEK,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+    // Grant permission to describe tables
+    agentRegistryTable.grant(healthCheckHandler, 'dynamodb:DescribeTable');
+    syncJobMappingTable.grant(healthCheckHandler, 'dynamodb:DescribeTable');
+
+    // --- Grant Table Access to Handlers ---
+    agentApiKeysSecret.grantRead(connectHandler);
     agentRegistryTable.grantReadWriteData(connectHandler);
     agentRegistryTable.grantReadWriteData(disconnectHandler);
     agentRegistryTable.grantReadWriteData(defaultHandler);
-    // Grant Job Ingestion handler permissions
-    agentRegistryTable.grantReadData(jobIngestionHandler); // Read agents
+    syncJobMappingTable.grantReadData(defaultHandler); // Default handler needs to read sync map
+    // jobRepositoryTable.grantReadWriteData(jobIngestionHandler); // Grant when table is enabled
 
-    // Grant Orchestrator Dispatcher handler permissions
-    orchestratorInputQueue.grantConsumeMessages(orchestratorDispatcherHandler);
-    agentRegistryTable.grantReadWriteData(orchestratorDispatcherHandler); // Find agents, mark busy/available
-    syncJobMappingTable.grantReadWriteData(orchestratorDispatcherHandler); // Store sync mapping
-    // Grant permission to post to WebSocket connections (already added to the shared role)
-    // webSocketApi.grantManageConnections(orchestratorDispatcherHandler); // Ensure role allows this
+    // --- HTTP API Gateway Integrations ---
+    // Job Ingestion Route
+    httpApi.addRoutes({
+        path: '/jobs',
+        methods: [apigw_http.HttpMethod.POST],
+        integration: new HttpLambdaIntegration('JobIngestionIntegration', jobIngestionHandler),
+    });
 
-    // Grant Default handler permissions for sync flow
-    syncJobMappingTable.grantReadWriteData(defaultHandler); // Read/Delete sync mapping
-    defaultHandler.addToRolePolicy(new iam.PolicyStatement({ // Send to temp response queues
-      effect: iam.Effect.ALLOW,
-      actions: ['sqs:SendMessage'],
-      resources: [`arn:aws:sqs:${this.region}:${this.account}:job-response-*`],
-    }));
+    // Health Check Route
+    httpApi.addRoutes({
+        path: '/health',
+        methods: [apigw_http.HttpMethod.GET],
+        integration: new HttpLambdaIntegration('HealthCheckIntegration', healthCheckHandler),
+    });
 
     // --- Outputs ---
-
-    // WebSocket API endpoint format: wss://{apiId}.execute-api.{region}.amazonaws.com/{stageName}
     new cdk.CfnOutput(this, 'WebSocketApiEndpoint', {
-      value: stage.url,
-      description: 'The endpoint URL for the WebSocket API',
+        value: stage.url,
+        description: 'The endpoint URL for the WebSocket API',
     });
 
     new cdk.CfnOutput(this, 'WebSocketApiId', {
-        value: webSocketApi.apiId,
-        description: 'The ID of the WebSocket API',
+      value: webSocketApi.apiId,
+      description: 'The ID of the WebSocket API',
     });
 
-    // Output the API Gateway CloudWatch Logs Role ARN
-    const apiGwLogsRole = new iam.Role(this, 'ApiGatewayLogsRole', {
-      assumedBy: new iam.ServicePrincipal('apigateway.amazonaws.com'),
-      managedPolicies: [
-        iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AmazonAPIGatewayPushToCloudWatchLogs'),
-      ],
-    });
-    new apigw_classic.CfnAccount(this, 'ApiGatewayAccount', {
-      cloudWatchRoleArn: apiGwLogsRole.roleArn,
-    }).node.addDependency(apiGwLogsRole);
-
-    // Grant API Gateway permission to write to the log group
-    wsApiAccessLogGroup.grantWrite(new iam.ServicePrincipal('apigateway.amazonaws.com'));
-
-    // Grant Default handler permissions for sync flow
-    syncJobMappingTable.grantReadWriteData(defaultHandler); // Read/Delete sync mapping
-    defaultHandler.addToRolePolicy(new iam.PolicyStatement({ // Send to temp response queues
-      effect: iam.Effect.ALLOW,
-      actions: ['sqs:SendMessage'],
-      resources: [`arn:aws:sqs:${this.region}:${this.account}:job-response-*`],
-    }));
-
-    // --- Outputs ---
-
-    // WebSocket API endpoint format: wss://{apiId}.execute-api.{region}.amazonaws.com/{stageName}
-    new cdk.CfnOutput(this, 'WebSocketApiEndpoint', {
-      value: stage.url,
-      description: 'The endpoint URL for the WebSocket API',
-    });
-
-    new cdk.CfnOutput(this, 'WebSocketApiId', {
-        value: webSocketApi.apiId,
-        description: 'The ID of the WebSocket API',
-    });
-
-    // Output the API Gateway CloudWatch Logs Role ARN
-    new cdk.CfnOutput(this, 'ApiGatewayLogsRoleArn', {
-      value: apiGwLogsRole.roleArn,
-      description: 'ARN of the IAM Role used by API Gateway to push logs to CloudWatch',
-    });
-
-    new cdk.CfnOutput(this, 'WebSocketAccessLogGroup', {
-        value: wsApiAccessLogGroup.logGroupName,
-        description: 'CloudWatch Log Group for WebSocket Access Logs',
-    });
-
-    // HTTP API endpoint format: https://{apiId}.execute-api.{region}.amazonaws.com
     new cdk.CfnOutput(this, 'HttpApiEndpoint', {
-        value: httpApi.url!,
-        description: 'The endpoint URL for the HTTP Job Ingestion API',
+        value: httpApi.url ? httpApi.url : 'Deployment error: No URL',
+        description: 'The endpoint URL for the HTTP API',
     });
 
     new cdk.CfnOutput(this, 'AgentApiKeysSecretName', {
-      value: agentApiKeysSecret.secretName,
-      description: 'Name of the Secrets Manager secret storing agent API keys',
+        value: agentApiKeysSecret.secretName,
+        description: 'Name of the Secrets Manager secret storing agent API keys',
     });
 
-    new cdk.CfnOutput(this, 'AgentRegistryTableNameOutput', {
+    new cdk.CfnOutput(this, 'AgentRegistryTableName', {
         value: agentRegistryTable.tableName,
         description: 'Name of the DynamoDB table for agent registry',
     });
 
-    new cdk.CfnOutput(this, 'SyncJobMappingTableNameOutput', {
+    new cdk.CfnOutput(this, 'SyncJobMappingTableName', {
         value: syncJobMappingTable.tableName,
         description: 'Name of the DynamoDB table for sync job mapping',
-    });
-
-    new cdk.CfnOutput(this, 'OrchestratorInputQueueUrl', {
-        value: orchestratorInputQueue.queueUrl,
-        description: 'URL of the SQS queue for orchestrator job input',
-    });
-
-    new cdk.CfnOutput(this, 'OrchestratorInputQueueArn', {
-        value: orchestratorInputQueue.queueArn,
-        description: 'ARN of the SQS queue for orchestrator job input',
     });
   }
 }

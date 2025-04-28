@@ -3,6 +3,8 @@ import { v4 as uuidv4 } from 'uuid';
 import { JobData } from '../utils/types';
 import { dispatchJob } from '../utils/job-dispatcher';
 import { SQSClient, CreateQueueCommand, DeleteQueueCommand, ReceiveMessageCommand, DeleteMessageCommand, GetQueueAttributesCommand, SendMessageCommand } from '@aws-sdk/client-sqs';
+import { logger } from '../utils/logger';
+import { CloudWatchClient, PutMetricDataCommand } from '@aws-sdk/client-cloudwatch';
 // import { DynamoDBClient } from '@aws-sdk/client-dynamodb'; // For Job Repository
 
 // const jobRepositoryTableName = process.env.JOB_REPOSITORY_TABLE_NAME;
@@ -11,6 +13,8 @@ const webSocketApiEndpoint = process.env.WEBSOCKET_API_ENDPOINT;
 const orchestratorQueueUrl = process.env.ORCHESTRATOR_QUEUE_URL; // Add this env var
 
 const sqsClient = new SQSClient({});
+const cloudwatchClient = new CloudWatchClient({}); // Initialize CloudWatch client
+const METRIC_NAMESPACE = 'DistributedResidentialProxy'; // Define a namespace for metrics
 
 // Constants for synchronous flow
 const SYNC_TIMEOUT_BUFFER_MS = 2000; // Buffer before Lambda timeout
@@ -299,5 +303,140 @@ async function deleteTempQueue(queueUrl: string, requestId: string, context: str
     } catch (deleteError: any) {
         // Log error but don't fail the main flow, queue will expire anyway
         console.error(`Request ${requestId} ${context}: Failed to delete temporary queue ${queueUrl}:`, deleteError);
+    }
+} 
+
+async function processSynchronously(jobPayload: any, timeoutSeconds: number): Promise<any> {
+  const correlationId = uuidv4();
+  const tempQueueName = `job-response-${correlationId}.fifo`;
+  let responseQueueUrl: string | undefined;
+  const startTime = Date.now(); // Record start time
+  let status = 'failure'; // Default status
+  let result: any;
+
+  try {
+    // Create temporary response queue
+    const createQueueResponse = await sqsClient.send(new CreateQueueCommand({
+      QueueName: tempQueueName,
+      Attributes: {
+        FifoQueue: 'true',
+        ContentBasedDeduplication: 'true',
+        MessageRetentionPeriod: '300' // 5 minutes
+      },
+      tags: { 
+        TemporaryQueue: 'true',
+        JobId: jobPayload.jobId
+      }
+    }));
+    
+    responseQueueUrl = createQueueResponse.QueueUrl;
+    if (!responseQueueUrl) {
+      throw new Error('Failed to create temporary response queue');
+    }
+    
+    // Send job to orchestrator with response queue info
+    await sqsClient.send(new SendMessageCommand({
+      QueueUrl: orchestratorQueueUrl,
+      MessageBody: JSON.stringify({
+        ...jobPayload,
+        responseQueueUrl,
+        correlationId
+      }),
+      MessageGroupId: correlationId,
+      MessageDeduplicationId: correlationId
+    }));
+    
+    logger.debug(`Waiting for response on queue ${responseQueueUrl} for job ${jobPayload.jobId}`);
+
+    // Wait for response
+    while (Date.now() - startTime < timeoutSeconds * 1000) {
+      const receiveResponse = await sqsClient.send(new ReceiveMessageCommand({
+        QueueUrl: responseQueueUrl,
+        MaxNumberOfMessages: 1,
+        WaitTimeSeconds: Math.min(5, timeoutSeconds - Math.ceil((Date.now() - startTime)/1000)) // Adjust wait time dynamically
+      }));
+      
+      if (receiveResponse.Messages && receiveResponse.Messages.length > 0) {
+        const message = receiveResponse.Messages[0];
+        logger.debug(`Received response message ${message.MessageId} for job ${jobPayload.jobId}`);
+        
+        // Delete message from queue
+        await sqsClient.send(new DeleteMessageCommand({
+          QueueUrl: responseQueueUrl,
+          ReceiptHandle: message.ReceiptHandle!
+        }));
+        
+        // Parse and return result
+        result = JSON.parse(message.Body || '{}');
+        // Determine status from the response payload if possible, otherwise assume success
+        status = result?.status || 'success'; 
+        logger.info(`Synchronous job ${jobPayload.jobId} completed with status: ${status}`);
+        return result; // Exit loop and function on success
+      }
+    }
+    
+    // If loop finishes without returning, it's a timeout
+    status = 'timeout';
+    logger.warn(`Synchronous job ${jobPayload.jobId} timed out after ${timeoutSeconds} seconds.`);
+    throw new Error(`Job processing timed out after ${timeoutSeconds} seconds`);
+
+  } catch(error) {
+      // status remains 'failure' unless overridden by timeout
+      logger.error(`Error during synchronous processing for job ${jobPayload.jobId}:`, error);
+      throw error; // Re-throw the error to be caught by the main handler
+  } finally {
+      const durationMs = Date.now() - startTime;
+      logger.debug(`Synchronous job ${jobPayload.jobId} finished processing. Status: ${status}, Duration: ${durationMs}ms`);
+      // Publish metrics regardless of success/failure/timeout
+      await publishMetrics(jobPayload.jobId, status, durationMs);
+
+      // Clean up temporary queue if it was created
+      if (responseQueueUrl) {
+          try {
+              await sqsClient.send(new DeleteQueueCommand({
+                  QueueUrl: responseQueueUrl
+              }));
+              logger.debug('Temporary response queue deleted', { queueUrl: responseQueueUrl });
+          } catch (error) {
+              logger.warn('Failed to delete temporary queue', { queueUrl: responseQueueUrl, error });
+          }
+      }
+  }
+}
+
+async function publishMetrics(jobId: string, status: string, durationMs: number): Promise<void> {
+    try {
+        const timestamp = new Date();
+        const metricData = [
+            {
+                MetricName: 'SynchronousJobResult',
+                Dimensions: [
+                    { Name: 'Status', Value: status },
+                    // Add other relevant dimensions like JobType if available
+                    // { Name: 'JobType', Value: jobPayload.jobType || 'Unknown' }
+                ],
+                Timestamp: timestamp,
+                Value: 1,
+                Unit: 'Count'
+            },
+            {
+                MetricName: 'SynchronousJobDuration',
+                Dimensions: [
+                     { Name: 'Status', Value: status }, // Optional: Dimension duration by status
+                ],
+                Timestamp: timestamp,
+                Value: durationMs,
+                Unit: 'Milliseconds'
+            }
+        ];
+
+        await cloudwatchClient.send(new PutMetricDataCommand({
+            Namespace: METRIC_NAMESPACE,
+            MetricData: metricData
+        }));
+        logger.debug('Successfully published CloudWatch metrics', { jobId, status, durationMs });
+    } catch (error) {
+        logger.warn('Failed to publish CloudWatch metrics', { jobId, error });
+        // Don't fail the whole request if metrics fail
     }
 } 
