@@ -5,7 +5,7 @@ import { OrchestratorStack } from '../lib/iac-stack';
 
 const app = new cdk.App();
 // Use CDK_STACK_NAME env var to avoid clashing with an existing stack
-const stackName = process.env.CDK_STACK_NAME ?? 'OrchestratorStack';
+const stackName = process.env.CDK_STACK_NAME ?? 'OrchestratorStackV2';
 new OrchestratorStack(app, stackName, {
   /* If you don't specify 'env', this stack will be environment-agnostic.
    * Account/Region-dependent features and context lookups will not work,
