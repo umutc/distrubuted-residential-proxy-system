@@ -179,23 +179,77 @@ function handlePong(message: PongMessage) {
 // --- Job Handling ---
 
 function handleJobRequest(message: JobRequestMessage) {
-    console.log(`Received job request for jobId: ${message.data.jobId}`);
+    console.log(`Received job request for jobId: ${message.data?.jobId || 'N/A'}`);
 
-    // Basic validation (more robust validation can be added)
-    if (!message.data || !message.data.jobId || !message.data.url || !message.data.method) {
-        console.error('Invalid job request message format:', message);
-        sendErrorResponse(message.requestId, message.data?.jobId, 'Invalid job request format');
+    // --- Robust Validation ---
+    if (!message.data) {
+        console.error('Invalid job request: Missing data field.');
+        sendErrorResponse(message.requestId, undefined, 'Invalid job request: Missing data field');
         return;
     }
 
     const { jobId, url, method, headers, body, bodyEncoding, timeoutMs } = message.data;
 
+    if (!jobId || typeof jobId !== 'string') {
+        sendErrorResponse(message.requestId, jobId, 'Invalid job request: Missing or invalid jobId');
+        return;
+    }
+    if (!url || typeof url !== 'string') {
+        sendErrorResponse(message.requestId, jobId, 'Invalid job request: Missing or invalid url');
+        return;
+    }
+    // Basic URL validation (can be enhanced)
+    try {
+        new URL(url);
+    } catch (e) {
+        sendErrorResponse(message.requestId, jobId, 'Invalid job request: Malformed URL');
+        return;
+    }
+
+    if (!method || typeof method !== 'string' || !['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'].includes(method.toUpperCase())) {
+        sendErrorResponse(message.requestId, jobId, `Invalid job request: Missing or invalid method: ${method}`);
+        return;
+    }
+
+    if (headers && typeof headers !== 'object') {
+        sendErrorResponse(message.requestId, jobId, 'Invalid job request: headers must be an object');
+        return;
+    }
+
+    if (body && typeof body !== 'string') {
+        sendErrorResponse(message.requestId, jobId, 'Invalid job request: body must be a string (potentially Base64 encoded)');
+        return;
+    }
+
+    if (bodyEncoding && !['base64', 'utf8'].includes(bodyEncoding)) {
+        sendErrorResponse(message.requestId, jobId, `Invalid job request: invalid bodyEncoding: ${bodyEncoding}. Must be 'base64' or 'utf8'.`);
+        return;
+    }
+
+    if (timeoutMs && typeof timeoutMs !== 'number') {
+        sendErrorResponse(message.requestId, jobId, 'Invalid job request: timeoutMs must be a number');
+        return;
+    }
+    // --- End Validation ---
+
+    let requestBody: Buffer | string | undefined = undefined;
+    if (body) {
+        if (bodyEncoding === 'base64') {
+            try {
+                requestBody = Buffer.from(body, 'base64');
+            } catch (e: any) {
+                sendErrorResponse(message.requestId, jobId, `Invalid job request: Failed to decode base64 body: ${e.message}`);
+                return;
+            }
+        } else { // Default to utf8 if encoding is 'utf8' or not specified
+            requestBody = body;
+        }
+    }
+
     // Implement actual HTTP execution (Subtask 5.2)
     console.log(`Executing job ${jobId}: ${method} ${url}`);
-    executeHttpRequest(jobId, url, method, headers, body, bodyEncoding, timeoutMs, message.requestId);
-
-    // For now, send a placeholder response
-    // sendSuccessResponse(message.requestId, jobId, 200, { 'content-type': 'text/plain' }, 'Placeholder response - HTTP execution not implemented yet');
+    // Pass the potentially decoded Buffer or original string
+    executeHttpRequest(jobId, url, method, headers, requestBody, timeoutMs, message.requestId);
 }
 
 async function executeHttpRequest(
@@ -203,8 +257,7 @@ async function executeHttpRequest(
     url: string,
     method: string,
     headers?: Record<string, string>,
-    body?: string, // Expects string (can be Base64 encoded for binary)
-    bodyEncoding?: 'base64' | 'utf8',
+    body?: Buffer | string, // Accept Buffer or string
     timeoutMs?: number,
     requestId?: string
 ) {
@@ -214,15 +267,22 @@ async function executeHttpRequest(
 
     try {
         console.log(`[${jobId}] Making ${method} request to ${url}`);
-        const { statusCode, headers: responseHeaders, body: responseBodyStream } = await request(url, {
+
+        const requestOptions: any = {
             method: method.toUpperCase(),
             headers: headers || {},
-            body: body ? (method.toUpperCase() !== 'GET' && method.toUpperCase() !== 'HEAD' ? body : undefined) : undefined,
             maxRedirections: MAX_REDIRECTS,
             headersTimeout: requestTimeout, // Timeout for receiving headers
             bodyTimeout: requestTimeout, // Timeout for receiving the body
             // TODO: Add more options if needed (e.g., custom agent for proxy)
-        });
+        };
+
+        // Only add body if method allows it and body is present
+        if (body && method.toUpperCase() !== 'GET' && method.toUpperCase() !== 'HEAD') {
+            requestOptions.body = body;
+        }
+
+        const { statusCode, headers: responseHeaders, body: responseBodyStream } = await request(url, requestOptions);
 
         console.log(`[${jobId}] Received status code: ${statusCode}`);
 
