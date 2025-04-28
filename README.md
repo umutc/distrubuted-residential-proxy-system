@@ -18,10 +18,10 @@ This project is managed using [Task Master](README-task-master.md) for AI-driven
 
 ## 📊 Progress
 
-**Overall MVP Completion: 5%**
+**Overall MVP Completion: 20%**
 
 ```
-[█░░░░░░░░░░░░░░░░░░░] 5% 
+[██░░░░░░░░░░░░░░░░░] 20% 
 ```
 *(Based on Task Master task statuses)*
 
@@ -29,8 +29,9 @@ This project is managed using [Task Master](README-task-master.md) for AI-driven
     -   ✅ Project Setup & Git Initialization
     -   ✅ Initial Task Generation from PRD
     -   ✅ Task 1.1: Create API Gateway WebSocket API with route configuration
+    -   ✅ Task 1.2: Implement backend compute with Lambda functions
 -   **Current Priorities:**
-    -   ⚙️ Task 1.2: Implement backend compute with Lambda functions ($connect done, $disconnect next)
+    -   ⚙️ Task 1.3: Deploy WebSocket API with CloudWatch logging and monitoring
     -   ⏱️ Task 2: Implement Agent authentication and registration
     -   ⏱️ Task 3: Develop basic Agent application
 
@@ -44,6 +45,7 @@ This project is managed using [Task Master](README-task-master.md) for AI-driven
 -   **Response Handling:** Agents return the response (status, headers, Base64-encoded body) or error to the Orchestrator via WebSocket.
 -   **Synchronous API:** The Orchestrator provides a synchronous API for internal services to submit jobs and receive proxied responses.
 -   **Agent Management:** Basic tracking of connected agents and their status (available/busy) within the Orchestrator.
+-   -   Lambda handlers use the `AGENT_REGISTRY_TABLE_NAME` environment variable to locate the agent registry DynamoDB table.
 -   **Configuration:** Agent configuration (Orchestrator URL, API Key) managed via environment variables.
 -   **Monitoring:** Basic API endpoint on the Orchestrator to list connected agents.
 -   **Timeout Handling:** Orchestrator implements timeouts for jobs sent to agents.
