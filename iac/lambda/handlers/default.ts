@@ -10,8 +10,10 @@ import { marshall, unmarshall } from '@aws-sdk/util-dynamodb'; // Import marshal
 import { v4 as uuidv4 } from 'uuid';
 import { AgentInfo } from '../utils/types';
 
+// Initialize clients outside the handler for potential reuse
 const dynamoDb = new DynamoDBClient({});
-const sqsClient = new SQSClient({}); // Initialize SQS Client
+const sqsClient = new SQSClient({}); 
+
 const TABLE_NAME = process.env.AGENT_REGISTRY_TABLE_NAME;
 const SYNC_JOB_MAPPING_TABLE_NAME = process.env.SYNC_JOB_MAPPING_TABLE_NAME;
 // const DEAD_LETTER_QUEUE_URL = process.env.DEAD_LETTER_QUEUE_URL;
