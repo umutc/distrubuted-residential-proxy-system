@@ -13,7 +13,11 @@ import { WebSocketIntegration, WebSocketIntegrationType } from '@aws-cdk/aws-api
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
-import * as apigw1 from 'aws-cdk-lib/aws-apigateway';
+// Use HttpApi and Lambda integrations for HTTP API
+import * as apigw_http from '@aws-cdk/aws-apigatewayv2-alpha';
+import { HttpLambdaIntegration } from '@aws-cdk/aws-apigatewayv2-integrations-alpha';
+// Use this for Account-level settings like CloudWatch role
+import * as apigw_classic from 'aws-cdk-lib/aws-apigateway';
 // import * as sqs from 'aws-cdk-lib/aws-sqs';
 
 // Placeholder Lambda ARN (replace in later tasks)
@@ -61,6 +65,27 @@ export class OrchestratorStack extends cdk.Stack {
       timeToLiveAttribute: 'ttl',
     });
 
+    // Add GSI for querying by status
+    agentRegistryTable.addGlobalSecondaryIndex({
+      indexName: 'StatusIndex',
+      partitionKey: { name: 'status', type: dynamodb.AttributeType.STRING },
+      // Optionally add a sort key if needed for further filtering, e.g., updatedAt
+      // sortKey: { name: 'updatedAt', type: dynamodb.AttributeType.STRING },
+      projectionType: dynamodb.ProjectionType.ALL, // Adjust as needed for query efficiency
+    });
+
+    // --- Job Repository DynamoDB Table (Placeholder for now) ---
+    // Future Task: Define schema and enable this table
+    /*
+    const jobRepositoryTable = new dynamodb.Table(this, 'JobRepositoryTable', {
+      tableName: 'distributed-res-proxy-job-repository',
+      partitionKey: { name: 'jobId', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY, // Adjust for production
+      // timeToLiveAttribute: 'ttl', // Consider TTL for jobs
+    });
+    */
+
     // --- Lambda Functions ---
 
     const connectHandler = new lambda_nodejs.NodejsFunction(this, 'ConnectHandler', {
@@ -96,6 +121,9 @@ export class OrchestratorStack extends cdk.Stack {
       handler: 'handler',
       runtime: lambda.Runtime.NODEJS_LATEST,
       role: webSocketHandlerRole,
+      environment: {
+        AGENT_REGISTRY_TABLE_NAME: agentRegistryTable.tableName,
+      },
     });
     new logs.LogGroup(this, 'DefaultHandlerLogGroup', {
       logGroupName: `/aws/lambda/${defaultHandler.functionName}`,
@@ -103,14 +131,7 @@ export class OrchestratorStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
-    // --- Grant Permissions ---
-    agentApiKeysSecret.grantRead(connectHandler); // Grant connect Lambda permission to read the secret
-    agentRegistryTable.grantReadWriteData(connectHandler);
-    agentRegistryTable.grantReadWriteData(disconnectHandler);
-    agentRegistryTable.grantReadWriteData(defaultHandler);
-
     // --- WebSocket API Gateway ---
-
     const webSocketApi = new apigwv2.WebSocketApi(this, 'ResidentialProxyWebSocketApi', {
       apiName: 'ResidentialProxyWebSocketApi',
       description: 'WebSocket API for Distributed Residential Proxy System',
@@ -173,6 +194,54 @@ export class OrchestratorStack extends cdk.Stack {
         // Throttling settings will use defaults if not specified here
     } as CfnStage.RouteSettingsProperty;
 
+    // --- HTTP API Gateway for Job Ingestion ---
+    const httpApi = new apigw_http.HttpApi(this, 'JobIngestionHttpApi', {
+        apiName: 'ResidentialProxyJobIngestionApi',
+        description: 'HTTP API for submitting proxy jobs',
+        corsPreflight: { // Configure CORS if needed for browser clients
+            allowHeaders: ['Content-Type', 'X-Amz-Date', 'Authorization', 'X-Api-Key'],
+            allowMethods: [apigw_http.CorsHttpMethod.POST, apigw_http.CorsHttpMethod.OPTIONS],
+            allowOrigins: ['*'], // Restrict in production
+        },
+        // Default stage is created automatically
+    });
+
+    // Define Job Ingestion Lambda *after* stage is defined to access stage.url
+    const jobIngestionHandler = new lambda_nodejs.NodejsFunction(this, 'JobIngestionHandler', {
+      entry: path.join(__dirname, '../lambda/handlers/job-ingestion.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_LATEST,
+      role: webSocketHandlerRole, // Reuse role for now
+      environment: {
+        AGENT_REGISTRY_TABLE_NAME: agentRegistryTable.tableName,
+        WEBSOCKET_API_ENDPOINT: stage.url // Pass WebSocket URL to the handler
+        // JOB_REPOSITORY_TABLE_NAME: jobRepositoryTable.tableName, // Add when table is enabled
+      },
+    });
+    new logs.LogGroup(this, 'JobIngestionHandlerLogGroup', {
+      logGroupName: `/aws/lambda/${jobIngestionHandler.functionName}`,
+      retention: logs.RetentionDays.ONE_WEEK,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    // --- Grant Permissions ---
+    agentApiKeysSecret.grantRead(connectHandler); // Grant connect Lambda permission to read the secret
+    agentRegistryTable.grantReadWriteData(connectHandler);
+    agentRegistryTable.grantReadWriteData(disconnectHandler);
+    agentRegistryTable.grantReadWriteData(defaultHandler);
+    // Grant Job Ingestion handler permissions
+    agentRegistryTable.grantReadData(jobIngestionHandler); // Read agents
+    // Grant permission to post back to the WebSocket API (already covered by role policy)
+    // webSocketApi.grantManageConnections(jobIngestionHandler);
+    // jobRepositoryTable.grantReadWriteData(jobIngestionHandler); // Add when table is enabled
+
+    // --- HTTP API Route Integration ---
+    httpApi.addRoutes({
+        path: '/jobs',
+        methods: [apigw_http.HttpMethod.POST],
+        integration: new HttpLambdaIntegration('JobIngestionIntegration', jobIngestionHandler),
+    });
+
     // --- IAM Role for API Gateway Logging ---
     const apiGwLogsRole = new iam.Role(this, 'ApiGatewayLogsRole', {
       assumedBy: new iam.ServicePrincipal('apigateway.amazonaws.com'),
@@ -182,7 +251,7 @@ export class OrchestratorStack extends cdk.Stack {
     });
 
     // --- Account-level API Gateway CloudWatch Logs Role Setting ---
-    new apigw1.CfnAccount(this, 'ApiGatewayAccount', {
+    new apigw_classic.CfnAccount(this, 'ApiGatewayAccount', {
       cloudWatchRoleArn: apiGwLogsRole.roleArn,
     }).node.addDependency(apiGwLogsRole);
 
@@ -211,6 +280,12 @@ export class OrchestratorStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'WebSocketAccessLogGroup', {
         value: wsApiAccessLogGroup.logGroupName,
         description: 'CloudWatch Log Group for WebSocket Access Logs',
+    });
+
+    // HTTP API endpoint format: https://{apiId}.execute-api.{region}.amazonaws.com
+    new cdk.CfnOutput(this, 'JobIngestionApiEndpoint', {
+        value: httpApi.url ? `${httpApi.url}jobs` : 'Deployment failed',
+        description: 'The base URL of the Job Ingestion HTTP API (append /jobs for POST)',
     });
   }
 }
