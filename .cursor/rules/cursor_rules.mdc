@@ -18,7 +18,7 @@ alwaysApply: true
   ```
 
 - **File References:**
-  - Always keep update the [README.md](mdc:README.md)
+  - Always keep update the [README.md](mdc:README.md) and Project status, progress etc...
 
 - **Code Examples:**
   - Use language-specific code blocks

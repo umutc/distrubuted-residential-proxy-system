@@ -41,6 +41,25 @@ export class OrchestratorStack extends cdk.Stack {
 
     // TODO: Add DynamoDB permissions later (Task 2)
 
+    // --- Agent API Keys Secret ---
+    const agentApiKeysSecret = new secretsmanager.Secret(this, 'AgentApiKeysSecret', {
+      secretName: 'distributed-res-proxy-agent-keys',
+      description: 'API keys for authenticating residential proxy agents',
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      generateSecretString: {
+        secretStringTemplate: JSON.stringify({}),
+        generateStringKey: 'dummy',
+      },
+    });
+
+    // --- Agent Registry DynamoDB Table ---
+    const agentRegistryTable = new dynamodb.Table(this, 'AgentRegistryTable', {
+      tableName: 'distributed-res-proxy-agent-registry',
+      partitionKey: { name: 'connectionId', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
     // --- Lambda Functions ---
 
     const connectHandler = new lambda_nodejs.NodejsFunction(this, 'ConnectHandler', {
@@ -48,6 +67,10 @@ export class OrchestratorStack extends cdk.Stack {
       handler: 'handler',
       runtime: lambda.Runtime.NODEJS_LATEST,
       role: webSocketHandlerRole,
+      environment: {
+        AGENT_KEYS_SECRET_NAME: agentApiKeysSecret.secretName,
+        AGENT_REGISTRY_TABLE_NAME: agentRegistryTable.tableName,
+      },
     });
     new logs.LogGroup(this, 'ConnectHandlerLogGroup', {
       logGroupName: `/aws/lambda/${connectHandler.functionName}`,
@@ -79,27 +102,8 @@ export class OrchestratorStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
-    // --- Agent API Keys Secret ---
-    const agentApiKeysSecret = new secretsmanager.Secret(this, 'AgentApiKeysSecret', {
-      secretName: 'distributed-res-proxy-agent-keys',
-      description: 'API keys for authenticating residential proxy agents',
-      removalPolicy: cdk.RemovalPolicy.DESTROY, // For dev/demo; change for prod
-      generateSecretString: {
-        secretStringTemplate: JSON.stringify({}),
-        generateStringKey: 'dummy', // Will be replaced with real keys
-      },
-    });
-
-    // Grant connect Lambda permission to read the secret
-    agentApiKeysSecret.grantRead(connectHandler);
-
-    // --- Agent Registry DynamoDB Table ---
-    const agentRegistryTable = new dynamodb.Table(this, 'AgentRegistryTable', {
-      tableName: 'distributed-res-proxy-agent-registry',
-      partitionKey: { name: 'connectionId', type: dynamodb.AttributeType.STRING },
-      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
-      removalPolicy: cdk.RemovalPolicy.DESTROY, // For dev/demo; change for prod
-    });
+    // --- Grant Permissions ---
+    agentApiKeysSecret.grantRead(connectHandler); // Grant connect Lambda permission to read the secret
     agentRegistryTable.grantReadWriteData(connectHandler);
     agentRegistryTable.grantReadWriteData(disconnectHandler);
     agentRegistryTable.grantReadWriteData(defaultHandler);

@@ -41,6 +41,9 @@ export const handler = async (event: APIGatewayProxyWebsocketEventV2): Promise<A
   console.log('Connect Event:', JSON.stringify(event, null, 2));
   const connectionId = event.requestContext.connectionId;
   const agentKey = getAgentKeyFromEvent(event);
+
+  console.log(`DEBUG: Received AGENT_KEY: ${agentKey}`);
+
   if (!agentKey) {
     console.warn(`No AGENT_KEY provided for connection: ${connectionId}`);
     return { statusCode: 401, body: 'Missing AGENT_KEY' };
@@ -48,11 +51,15 @@ export const handler = async (event: APIGatewayProxyWebsocketEventV2): Promise<A
   let agentKeys;
   try {
     agentKeys = await getAgentKeys();
+    console.log('DEBUG: Fetched agent keys from Secrets Manager:', JSON.stringify(agentKeys));
   } catch (err) {
     console.error('Failed to fetch agent keys:', err);
     return { statusCode: 500, body: 'Internal error' };
   }
+
   const valid = Object.values(agentKeys).includes(agentKey);
+  console.log(`DEBUG: Key validation result for ${agentKey}: ${valid}`);
+
   if (!valid) {
     console.warn(`Invalid AGENT_KEY for connection: ${connectionId}`);
     return { statusCode: 401, body: 'Invalid AGENT_KEY' };

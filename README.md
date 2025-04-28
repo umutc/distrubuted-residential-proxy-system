@@ -18,18 +18,19 @@ This project is managed using [Task Master](README-task-master.md) for AI-driven
 
 ## 📊 Progress
 
-**Overall MVP Completion: 0%**
+**Overall MVP Completion: 5%**
 
 ```
-[░░░░░░░░░░░░░░░░░░░░] 0% 
+[█░░░░░░░░░░░░░░░░░░░] 5% 
 ```
 *(Based on Task Master task statuses)*
 
 -   **Completed Milestones:**
     -   ✅ Project Setup & Git Initialization
     -   ✅ Initial Task Generation from PRD
+    -   ✅ Task 1.1: Create API Gateway WebSocket API with route configuration
 -   **Current Priorities:**
-    -   ⏱️ Task 1: Set up Orchestrator WebSocket infrastructure
+    -   ⚙️ Task 1.2: Implement backend compute with Lambda functions ($connect done, $disconnect next)
     -   ⏱️ Task 2: Implement Agent authentication and registration
     -   ⏱️ Task 3: Develop basic Agent application
 
