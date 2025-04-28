@@ -26,4 +26,7 @@ node_modules/
 
 # Task files
 tasks.json
-tasks/ 
+tasks/
+
+# Ignore Task Master configuration with potential secrets
+.cursor/mcp.json 
