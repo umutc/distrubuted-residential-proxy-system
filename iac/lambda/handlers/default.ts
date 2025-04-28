@@ -2,14 +2,18 @@ import { ApiGatewayManagementApi, PostToConnectionCommand } from '@aws-sdk/clien
 import { APIGatewayProxyWebsocketEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 import { validateMessage } from '../utils/schema-validator';
 import { markAgentAsAvailable } from '../utils/agent-registry';
+import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
 // import { createMetric } from '../utils/metrics'; // Placeholder for future metrics
 // import AWS from 'aws-sdk'; // For SQS dead-letter queue if needed
-import { DynamoDBClient, UpdateItemCommand } from '@aws-sdk/client-dynamodb';
+import { DynamoDBClient, UpdateItemCommand, GetItemCommand, DeleteItemCommand } from '@aws-sdk/client-dynamodb';
+import { marshall, unmarshall } from '@aws-sdk/util-dynamodb'; // Import marshall/unmarshall
 import { v4 as uuidv4 } from 'uuid';
 import { AgentInfo } from '../utils/types';
 
 const dynamoDb = new DynamoDBClient({});
+const sqsClient = new SQSClient({}); // Initialize SQS Client
 const TABLE_NAME = process.env.AGENT_REGISTRY_TABLE_NAME;
+const SYNC_JOB_MAPPING_TABLE_NAME = process.env.SYNC_JOB_MAPPING_TABLE_NAME;
 // const DEAD_LETTER_QUEUE_URL = process.env.DEAD_LETTER_QUEUE_URL;
 
 // Note: Instantiating the client outside the handler for potential reuse
@@ -134,6 +138,63 @@ export const handler = async (event: APIGatewayProxyWebsocketEventV2): Promise<A
         } else if (status === 'failure' && jobError) {
           console.error(`[${jobId}] Error: ${jobError.message}, StatusCode=${jobError.statusCode}`);
           // TODO (Future Task): Store error details in JobRepository/DynamoDB
+        }
+
+        // --- Notify Waiting Synchronous Handler (if applicable) --- 
+        if (SYNC_JOB_MAPPING_TABLE_NAME) {
+          try {
+            console.log(`[${jobId}] Checking sync mapping table ${SYNC_JOB_MAPPING_TABLE_NAME} for sync info.`);
+            const getItemCommand = new GetItemCommand({
+              TableName: SYNC_JOB_MAPPING_TABLE_NAME,
+              Key: marshall({ jobId: jobId }),
+            });
+            const syncInfoResult = await dynamoDb.send(getItemCommand);
+
+            if (syncInfoResult.Item) {
+              const syncInfo = unmarshall(syncInfoResult.Item);
+              const { responseQueueUrl, correlationId } = syncInfo;
+
+              if (responseQueueUrl && correlationId) {
+                console.log(`[${jobId}] Found sync info: correlationId=${correlationId}, queue=${responseQueueUrl}. Sending response.`);
+                
+                // Construct response payload for the original API caller
+                const responsePayload = {
+                  jobId: jobId,
+                  status: status,
+                  statusCode: status === 'success' ? (result?.statusCode || 200) : (jobError?.statusCode || 500),
+                  headers: status === 'success' ? (result?.headers || {}) : {},
+                  payload: status === 'success' ? result?.body : undefined, // Body might be base64 encoded from agent
+                  isBase64Encoded: status === 'success' ? result?.isBase64Encoded : false,
+                  error: status === 'failure' ? (jobError?.message || 'Agent processing failed') : undefined,
+                };
+
+                // Send response to the temporary queue
+                await sqsClient.send(new SendMessageCommand({
+                  QueueUrl: responseQueueUrl,
+                  MessageBody: JSON.stringify(responsePayload),
+                  MessageGroupId: correlationId, // Use correlationId for FIFO queue
+                }));
+                console.log(`[${jobId}] Successfully sent response to queue ${responseQueueUrl}`);
+
+                // Delete the mapping entry from DynamoDB
+                await dynamoDb.send(new DeleteItemCommand({
+                  TableName: SYNC_JOB_MAPPING_TABLE_NAME,
+                  Key: marshall({ jobId: jobId }),
+                }));
+                console.log(`[${jobId}] Deleted sync mapping info from ${SYNC_JOB_MAPPING_TABLE_NAME}`);
+
+              } else {
+                 console.warn(`[${jobId}] Sync info found but missing responseQueueUrl or correlationId.`);
+              }
+            } else {
+               console.log(`[${jobId}] No sync info found. Assuming async job or timed out.`);
+            }
+          } catch (syncNotifyError: any) {
+             console.error(`[${jobId}] Error during sync notification process:`, syncNotifyError);
+             // Log error, but don't fail the primary job response handling for the agent
+          }
+        } else {
+           console.warn(`[${jobId}] SYNC_JOB_MAPPING_TABLE_NAME not set. Skipping sync notification check.`);
         }
 
         // --- Mark Agent as Available --- 

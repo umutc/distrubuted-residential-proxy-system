@@ -65,6 +65,14 @@ interface JobRequestMessage extends BaseMessage {
 // Add more interfaces for job responses etc. later
 // interface JobResponseMessage extends BaseMessage { action: 'job_response'; data: { jobId: string; statusCode: number; ... } }
 
+// Structure for standardized errors
+interface AgentError {
+    code: string; // e.g., AGENT_NETWORK_ERROR, AGENT_TARGET_ERROR, AGENT_TIMEOUT
+    message: string;
+    statusCode?: number; // HTTP status code from target if relevant
+    details?: any; // Any additional context
+}
+
 function connect() {
   if (reconnectTimeoutId) {
     clearTimeout(reconnectTimeoutId);
@@ -184,50 +192,50 @@ function handleJobRequest(message: JobRequestMessage) {
     // --- Robust Validation ---
     if (!message.data) {
         console.error('Invalid job request: Missing data field.');
-        sendErrorResponse(message.requestId, undefined, 'Invalid job request: Missing data field');
+        sendErrorResponse(message.requestId, undefined, 'Invalid job request: Missing data field', 'AGENT_VALIDATION_ERROR');
         return;
     }
 
     const { jobId, url, method, headers, body, bodyEncoding, timeoutMs } = message.data;
 
     if (!jobId || typeof jobId !== 'string') {
-        sendErrorResponse(message.requestId, jobId, 'Invalid job request: Missing or invalid jobId');
+        sendErrorResponse(message.requestId, jobId, 'Invalid job request: Missing or invalid jobId', 'AGENT_VALIDATION_ERROR');
         return;
     }
     if (!url || typeof url !== 'string') {
-        sendErrorResponse(message.requestId, jobId, 'Invalid job request: Missing or invalid url');
+        sendErrorResponse(message.requestId, jobId, 'Invalid job request: Missing or invalid url', 'AGENT_VALIDATION_ERROR');
         return;
     }
     // Basic URL validation (can be enhanced)
     try {
         new URL(url);
     } catch (e) {
-        sendErrorResponse(message.requestId, jobId, 'Invalid job request: Malformed URL');
+        sendErrorResponse(message.requestId, jobId, 'Invalid job request: Malformed URL', 'AGENT_VALIDATION_ERROR');
         return;
     }
 
     if (!method || typeof method !== 'string' || !['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'].includes(method.toUpperCase())) {
-        sendErrorResponse(message.requestId, jobId, `Invalid job request: Missing or invalid method: ${method}`);
+        sendErrorResponse(message.requestId, jobId, `Invalid job request: Missing or invalid method: ${method}`, 'AGENT_VALIDATION_ERROR');
         return;
     }
 
     if (headers && typeof headers !== 'object') {
-        sendErrorResponse(message.requestId, jobId, 'Invalid job request: headers must be an object');
+        sendErrorResponse(message.requestId, jobId, 'Invalid job request: headers must be an object', 'AGENT_VALIDATION_ERROR');
         return;
     }
 
     if (body && typeof body !== 'string') {
-        sendErrorResponse(message.requestId, jobId, 'Invalid job request: body must be a string (potentially Base64 encoded)');
+        sendErrorResponse(message.requestId, jobId, 'Invalid job request: body must be a string (potentially Base64 encoded)', 'AGENT_VALIDATION_ERROR');
         return;
     }
 
     if (bodyEncoding && !['base64', 'utf8'].includes(bodyEncoding)) {
-        sendErrorResponse(message.requestId, jobId, `Invalid job request: invalid bodyEncoding: ${bodyEncoding}. Must be 'base64' or 'utf8'.`);
+        sendErrorResponse(message.requestId, jobId, `Invalid job request: invalid bodyEncoding: ${bodyEncoding}. Must be 'base64' or 'utf8'.`, 'AGENT_VALIDATION_ERROR');
         return;
     }
 
     if (timeoutMs && typeof timeoutMs !== 'number') {
-        sendErrorResponse(message.requestId, jobId, 'Invalid job request: timeoutMs must be a number');
+        sendErrorResponse(message.requestId, jobId, 'Invalid job request: timeoutMs must be a number', 'AGENT_VALIDATION_ERROR');
         return;
     }
     // --- End Validation ---
@@ -238,7 +246,7 @@ function handleJobRequest(message: JobRequestMessage) {
             try {
                 requestBody = Buffer.from(body, 'base64');
             } catch (e: any) {
-                sendErrorResponse(message.requestId, jobId, `Invalid job request: Failed to decode base64 body: ${e.message}`);
+                sendErrorResponse(message.requestId, jobId, `Invalid job request: Failed to decode base64 body: ${e.message}`, 'AGENT_VALIDATION_ERROR');
                 return;
             }
         } else { // Default to utf8 if encoding is 'utf8' or not specified
@@ -246,12 +254,27 @@ function handleJobRequest(message: JobRequestMessage) {
         }
     }
 
-    // Implement actual HTTP execution (Subtask 5.2)
-    console.log(`Executing job ${jobId}: ${method} ${url}`);
-    // Pass the potentially decoded Buffer or original string
-    executeHttpRequest(jobId, url, method, headers, requestBody, timeoutMs, message.requestId);
+    // Implement actual HTTP execution
+    console.log(`Executing job ${jobId}: ${method.toUpperCase()} ${url}`);
+    // Use a non-blocking approach
+    executeHttpRequest(
+        jobId,
+        url,
+        method.toUpperCase(),
+        headers,
+        requestBody,
+        timeoutMs,
+        message.requestId
+    ).catch(executionError => {
+        // This catch is a safety net for unexpected errors within executeHttpRequest itself
+        console.error(`[${jobId}] Unexpected error during executeHttpRequest promise:`, executionError);
+        sendErrorResponse(message.requestId, jobId, 'Internal agent error during job execution', 'AGENT_INTERNAL_ERROR');
+    });
 }
 
+/**
+ * Executes the HTTP request based on job data.
+ */
 async function executeHttpRequest(
     jobId: string,
     url: string,
@@ -261,56 +284,91 @@ async function executeHttpRequest(
     timeoutMs?: number,
     requestId?: string
 ) {
-    const MAX_REDIRECTS = 5;
-    const DEFAULT_TIMEOUT = 30000; // 30 seconds
-    const requestTimeout = timeoutMs || DEFAULT_TIMEOUT;
+    const controller = new AbortController();
+    const timeout = timeoutMs || 30000; // Default 30s timeout
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
 
     try {
-        console.log(`[${jobId}] Making ${method} request to ${url}`);
+        console.log(`[${jobId}] Sending request to ${url} with timeout ${timeout}ms`);
+        const res = await request(url, {
+            method: method,
+            headers: headers,
+            body: body,
+            signal: controller.signal,
+            // TODO: Add redirect handling if needed: follow: 5
+        });
+        clearTimeout(timeoutId);
 
-        const requestOptions: any = {
-            method: method.toUpperCase(),
-            headers: headers || {},
-            maxRedirections: MAX_REDIRECTS,
-            headersTimeout: requestTimeout, // Timeout for receiving headers
-            bodyTimeout: requestTimeout, // Timeout for receiving the body
-            // TODO: Add more options if needed (e.g., custom agent for proxy)
-        };
+        console.log(`[${jobId}] Received response: ${res.statusCode}`);
 
-        // Only add body if method allows it and body is present
-        if (body && method.toUpperCase() !== 'GET' && method.toUpperCase() !== 'HEAD') {
-            requestOptions.body = body;
+        // Read response body
+        const responseBodyBuffer = Buffer.from(await res.body.arrayBuffer());
+
+        // Handle non-2xx status codes as errors
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+            console.warn(`[${jobId}] Target server returned non-2xx status: ${res.statusCode}`);
+            let errorDetails: any = responseBodyBuffer.toString('utf8'); // Attempt to parse body as text
+            try {
+                 // Try parsing as JSON if content-type suggests it
+                 if (res.headers['content-type']?.includes('application/json')) {
+                    errorDetails = JSON.parse(errorDetails);
+                 }
+            } catch (parseError) {
+                 // Ignore if body is not valid JSON
+                 console.log(`[${jobId}] Response body for error status ${res.statusCode} is not JSON.`);
+            }
+            sendErrorResponse(
+                requestId,
+                jobId,
+                `Target server responded with status ${res.statusCode}`,
+                'AGENT_TARGET_ERROR',
+                res.statusCode,
+                { responseBody: errorDetails } // Include response body in details
+            );
+            return; // Stop processing on error
         }
 
-        const { statusCode, headers: responseHeaders, body: responseBodyStream } = await request(url, requestOptions);
-
-        console.log(`[${jobId}] Received status code: ${statusCode}`);
-
-        // Read the response body into a buffer
-        const chunks: Buffer[] = []; // Explicitly type chunks as Buffer[]
-        for await (const chunk of responseBodyStream) {
-            chunks.push(Buffer.from(chunk)); // Ensure chunk is treated as Buffer
-        }
-        const responseBodyBuffer = Buffer.concat(chunks);
-
-        // TODO: Implement response formatting (Subtask 5.3)
-        sendSuccessResponse(requestId, jobId, statusCode, responseHeaders as Record<string, string>, responseBodyBuffer);
+        // Success: Send response back to orchestrator
+        sendSuccessResponse(
+            requestId,
+            jobId,
+            res.statusCode,
+            res.headers as Record<string, string>, // Cast might be needed
+            responseBodyBuffer
+        );
 
     } catch (error: any) {
-        console.error(`[${jobId}] Error executing HTTP request:`, error.message);
-        sendErrorResponse(requestId, jobId, `HTTP request failed: ${error.message}`, error.statusCode);
+        clearTimeout(timeoutId);
+        console.error(`[${jobId}] Error executing HTTP request:`, error);
+
+        let errorCode = 'AGENT_UNKNOWN_ERROR';
+        let errorMessage = error.message || 'Unknown error executing request';
+        let statusCode: number | undefined = undefined;
+
+        if (error.name === 'AbortError' || error.code === 'UND_ERR_ABORTED') {
+            errorCode = 'AGENT_TIMEOUT';
+            errorMessage = `Request timed out after ${timeout}ms`;
+        } else if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED' || error.code === 'ECONNRESET') {
+            errorCode = 'AGENT_NETWORK_ERROR';
+            errorMessage = `Network error: ${error.code || error.message}`;
+        } else if (error.statusCode) {
+             // Sometimes undici might throw errors with status codes (e.g., invalid URL?)
+             errorCode = 'AGENT_REQUEST_ERROR';
+             statusCode = error.statusCode;
+        }
+        // Add more specific error code mappings as needed
+
+        sendErrorResponse(requestId, jobId, errorMessage, errorCode, statusCode);
     }
 }
 
+/**
+ * Sends a successful job response back to the Orchestrator.
+ */
 function sendSuccessResponse(requestId: string | undefined, jobId: string, statusCode: number, headers: Record<string, string>, body: Buffer) {
-    // Determine if body should be Base64 encoded (e.g., based on content-type or just default to it)
-    // Simple approach: Assume binary if content-type suggests it, or if it's not easily identified as text.
-    // More robust: Check content-type for known text types (text/*, application/json, application/xml, etc.)
-    const contentType = headers['content-type']?.toLowerCase() || '';
-    const isTextBased = contentType.startsWith('text/') || contentType.includes('json') || contentType.includes('xml') || contentType.includes('javascript');
-
-    const responseBody = isTextBased ? body.toString('utf8') : body.toString('base64');
-    const isBase64Encoded = !isTextBased;
+    // Base64 encode body for safe JSON transport
+    const bodyBase64 = body.toString('base64');
+    const isBase64Encoded = true; // Always encode for simplicity, receiver can decode
 
     const responseMessage = {
         action: 'job_response',
@@ -321,26 +379,34 @@ function sendSuccessResponse(requestId: string | undefined, jobId: string, statu
             result: {
                 statusCode: statusCode,
                 headers: headers,
-                body: responseBody,
-                isBase64Encoded: isBase64Encoded
-            }
-        }
+                body: bodyBase64,
+                isBase64Encoded: isBase64Encoded,
+            },
+        },
     };
+    console.log(`[${jobId}] Sending success response.`);
     sendMessage(responseMessage);
 }
 
-function sendErrorResponse(requestId: string | undefined, jobId: string | undefined, error: string, statusCode?: number) {
+/**
+ * Sends an error job response back to the Orchestrator.
+ */
+function sendErrorResponse(requestId: string | undefined, jobId: string | undefined, message: string, errorCode: string, statusCode?: number, details?: any) {
+    console.error(`[${jobId || 'N/A'}] Sending error response: Code=${errorCode}, Msg=${message}`);
+    const errorPayload: AgentError = {
+        code: errorCode,
+        message: message,
+        statusCode: statusCode,
+        details: details,
+    };
     const responseMessage = {
         action: 'job_response',
         requestId: requestId,
         data: {
-            jobId: jobId || 'unknown',
+            jobId: jobId || 'unknown', // Include jobId if known
             status: 'failure',
-            error: {
-                message: error,
-                statusCode: statusCode
-            }
-        }
+            error: errorPayload,
+        },
     };
     sendMessage(responseMessage);
 }

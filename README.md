@@ -18,20 +18,28 @@ This project is managed using [Task Master](README-task-master.md) for AI-driven
 
 ## 📊 Progress
 
-**Overall MVP Completion: 25%**
+**Overall MVP Completion: 70%**
 
 ```
-[████░░░░░░░░░░░░░░░░] 25% 
+[█████████████░░░░░░░] 70% 
 ```
 *(Based on Task Master task statuses)*
 
--   **Completed Milestones:**
+-   **Completed Tasks:**
     -   ✅ Project Setup & Git Initialization
     -   ✅ Initial Task Generation from PRD
-    -   ✅ Task 1.1: Create API Gateway WebSocket API with route configuration
-    -   ✅ Task 1.2: Implement backend compute with Lambda functions
--   **Completed Tasks (In Progress - Partially Done):**
-    -   ⚙️ Task 5.1: Implement Agent message handler for `job_request` (Identified handler, added `bodyEncoding` to interface).
+    -   ✅ Task 1: Set up Orchestrator WebSocket infrastructure
+    -   ✅ Task 2: Implement Agent authentication and registration
+    -   ✅ Task 3: Develop basic Agent application
+    -   ✅ Task 4: Implement job distribution from Orchestrator to Agent
+    -   ✅ Task 5: Implement HTTP request execution in Agent
+    -   ✅ Task 6: Implement job response handling in Orchestrator
+    -   ✅ Task 7: Develop Job Ingestion API endpoint
+
+-   **Current Priorities:**
+    -   ⏱️ Task 8: Implement synchronous job request/response flow
+    -   ⏱️ Task 9: Create basic agent monitoring endpoint
+    -   ⏱️ Task 10: Implement job timeout mechanism
 
 ## Core Features (MVP)
 
@@ -50,21 +58,21 @@ This project is managed using [Task Master](README-task-master.md) for AI-driven
 
 The system consists of two main components:
 
-1.  **Orchestrator:** A central service hosted on AWS (likely using API Gateway WebSocket/HTTP APIs and Lambda/ECS Fargate for compute). It handles:
-    -   Agent authentication and connection management.
+1.  **Orchestrator:** A central service hosted on AWS defined by the Infrastructure as Code (IaC) in the root `/iac` directory (using AWS CDK). It likely uses API Gateway (WebSocket & HTTP) and Lambda/ECS Fargate for compute. It handles:
+    -   Agent authentication and connection management via WebSocket.
     -   Receiving jobs from internal services via an HTTP API.
     -   Distributing jobs to connected Agents via WebSocket.
     -   Receiving responses from Agents.
     -   Returning responses to the originating service.
     -   Maintaining an Agent registry (in-memory for MVP).
     -   Providing a monitoring endpoint.
-2.  **Agent:** A lightweight Node.js application designed to run on operator machines (Windows, macOS, Linux) with residential internet connections. It handles:
+2.  **Agent:** A lightweight Node.js application (code located in `/agent`) designed to run on operator machines (Windows, macOS, Linux) with residential internet connections. It handles:
     -   Connecting to the Orchestrator via WebSocket (WSS).
     -   Authenticating using an `AGENT_KEY`.
     -   Receiving job details from the Orchestrator.
     -   Executing the specified HTTP(S) request locally using its residential IP (using `undici` or `node-fetch`).
     -   Sending the response back to the Orchestrator.
-    -   Reading configuration (`ORCH_WS`, `AGENT_KEY`) from environment variables.
+    -   Reading configuration (`ORCH_WS`, `AGENT_KEY`) from an `.env` file within the `/agent` directory.
 
 ## Setup
 
@@ -75,25 +83,28 @@ The system consists of two main components:
     -   Anthropic API Key (if using Task Master AI features): Set `ANTHROPIC_API_KEY` environment variable.
 
 2.  **Orchestrator Deployment:**
-    -   Deploy the Orchestrator components to AWS (details depend on chosen services like API Gateway, Lambda/ECS). Infrastructure setup is covered in Task 1.
-    -   Obtain the Orchestrator WebSocket URL (`wss://...`).
-    -   Configure secure storage for Agent API keys (e.g., AWS Secrets Manager) - covered in Task 2.
-    -   Provision API keys for Agents.
+    -   Navigate to the root `/iac` directory: `cd iac`.
+    -   Install CDK dependencies: `npm install`.
+    -   Configure AWS credentials for your target account/region.
+    -   Deploy the stack: `cdk deploy`.
+    -   The deployment outputs will include the Orchestrator WebSocket URL (`wss://...`) and the Job Ingestion HTTP API endpoint (`https://...`).
+    -   Configure secure storage for Agent API keys (e.g., AWS Secrets Manager) - the stack creates a secret named `distributed-res-proxy-agent-keys`.
+    -   Add API keys for your agents to the `distributed-res-proxy-agent-keys` secret in AWS Secrets Manager.
 
 3.  **Agent Setup:**
-    -   Clone this repository or distribute the Agent application code.
-    -   Navigate to the Agent directory (once created).
-    -   Install dependencies: `npm install` (dependencies like `ws`, `undici`/`node-fetch`, `dotenv` will be needed - covered in Task 3).
-    -   Create a `.env` file in the Agent directory with:
+    -   Clone this repository.
+    -   Navigate to the Agent directory: `cd agent`.
+    -   Install dependencies: `npm install`.
+    -   Create a `.env` file in the `/agent` directory with:
         ```dotenv
-        ORCH_WS=wss://your-orchestrator-websocket-url
-        AGENT_KEY=your-provisioned-agent-api-key
+        ORCH_WS=wss://your-orchestrator-websocket-url-from-cdk-output
+        AGENT_KEY=your-provisioned-agent-api-key-from-secrets-manager
         ```
-    -   Run the Agent: `node index.js` (or similar entry point - covered in Task 3).
+    -   Run the Agent: `node dist/agent.js` (assuming a build step, or `ts-node src/agent.ts` for development).
 
 ## Usage
 
-1.  **Running the Agent:** Once configured, start the Agent application on the operator's machine (`node index.js`). It will connect to the Orchestrator and become available for jobs. Logs will indicate connection status.
+1.  **Running the Agent:** Once configured, start the Agent application on the operator's machine (`node dist/agent.js`). It will connect to the Orchestrator and become available for jobs. Logs will indicate connection status.
 
 2.  **Submitting Jobs (Internal Services):** Internal services interact with the Orchestrator's job ingestion API (covered in Task 7 & 8). The API endpoint (e.g., `POST /jobs`) will accept a JSON payload like:
     ```json
