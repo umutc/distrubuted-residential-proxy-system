@@ -18,10 +18,10 @@ This project is managed using [Task Master](README-task-master.md) for AI-driven
 
 ## 📊 Progress
 
-**Overall MVP Completion: 20%**
+**Overall MVP Completion: 25%**
 
 ```
-[██░░░░░░░░░░░░░░░░░] 20% 
+[████░░░░░░░░░░░░░░░░] 25% 
 ```
 *(Based on Task Master task statuses)*
 
@@ -30,12 +30,8 @@ This project is managed using [Task Master](README-task-master.md) for AI-driven
     -   ✅ Initial Task Generation from PRD
     -   ✅ Task 1.1: Create API Gateway WebSocket API with route configuration
     -   ✅ Task 1.2: Implement backend compute with Lambda functions
--   **Current Priorities:**
-    -   ⚙️ Task 1.3: Deploy WebSocket API with CloudWatch logging and monitoring
-    -   ⏱️ Task 2: Implement Agent authentication and registration
-    -   ⏱️ Task 3: Develop basic Agent application
-
----
+-   **Completed Tasks (In Progress - Partially Done):**
+    -   ⚙️ Task 5.1: Implement Agent message handler for `job_request` (Identified handler, added `bodyEncoding` to interface).
 
 ## Core Features (MVP)
 

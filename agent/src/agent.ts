@@ -1,5 +1,6 @@
 import WebSocket from 'ws';
 import dotenv from 'dotenv';
+import { request } from 'undici';
 
 // Load environment variables from .env file
 dotenv.config();
@@ -45,8 +46,23 @@ interface PongMessage extends BaseMessage {
     receivedData?: any; // Echoed data from ping
 }
 
-// Add more interfaces for job requests, responses etc. later
-// interface JobRequestMessage extends BaseMessage { action: 'job_request'; data: { jobId: string; url: string; ... } }
+// --- Job Interfaces ---
+interface JobRequestData {
+    jobId: string;
+    url: string;
+    method: string; // GET, POST, etc.
+    headers?: Record<string, string>;
+    body?: string; // Base64 encoded for binary, otherwise string
+    bodyEncoding?: 'base64' | 'utf8'; // Optional: specify encoding if body is present
+    timeoutMs?: number; // Optional timeout for the request
+}
+
+interface JobRequestMessage extends BaseMessage {
+    action: 'job_request';
+    data: JobRequestData;
+}
+
+// Add more interfaces for job responses etc. later
 // interface JobResponseMessage extends BaseMessage { action: 'job_response'; data: { jobId: string; statusCode: number; ... } }
 
 function connect() {
@@ -74,9 +90,9 @@ function connect() {
         case 'pong':
           handlePong(message as PongMessage);
           break;
-        // case 'job_request': // TODO: Handle job requests (Task 5)
-        //   handleJobRequest(message as JobRequestMessage);
-        //   break;
+        case 'job_request':
+          handleJobRequest(message as JobRequestMessage);
+          break;
         default:
           console.warn(`Unknown action received: ${message.action}`);
       }
@@ -158,6 +174,130 @@ function stopPing() {
 function handlePong(message: PongMessage) {
     console.log(`	💓 Received pong. Round trip latency (if timestamp included): ${message.timestamp ? Date.now() - Number(message.timestamp) : 'N/A'} ms`);
     // Optionally track latency or confirm connection is alive
+}
+
+// --- Job Handling ---
+
+function handleJobRequest(message: JobRequestMessage) {
+    console.log(`Received job request for jobId: ${message.data.jobId}`);
+
+    // Basic validation (more robust validation can be added)
+    if (!message.data || !message.data.jobId || !message.data.url || !message.data.method) {
+        console.error('Invalid job request message format:', message);
+        sendErrorResponse(message.requestId, message.data?.jobId, 'Invalid job request format');
+        return;
+    }
+
+    const { jobId, url, method, headers, body, bodyEncoding, timeoutMs } = message.data;
+
+    // Implement actual HTTP execution (Subtask 5.2)
+    console.log(`Executing job ${jobId}: ${method} ${url}`);
+    executeHttpRequest(jobId, url, method, headers, body, bodyEncoding, timeoutMs, message.requestId);
+
+    // For now, send a placeholder response
+    // sendSuccessResponse(message.requestId, jobId, 200, { 'content-type': 'text/plain' }, 'Placeholder response - HTTP execution not implemented yet');
+}
+
+async function executeHttpRequest(
+    jobId: string,
+    url: string,
+    method: string,
+    headers?: Record<string, string>,
+    body?: string, // Expects string (can be Base64 encoded for binary)
+    bodyEncoding?: 'base64' | 'utf8',
+    timeoutMs?: number,
+    requestId?: string
+) {
+    const MAX_REDIRECTS = 5;
+    const DEFAULT_TIMEOUT = 30000; // 30 seconds
+    const requestTimeout = timeoutMs || DEFAULT_TIMEOUT;
+
+    try {
+        console.log(`[${jobId}] Making ${method} request to ${url}`);
+        const { statusCode, headers: responseHeaders, body: responseBodyStream } = await request(url, {
+            method: method.toUpperCase(),
+            headers: headers || {},
+            body: body ? (method.toUpperCase() !== 'GET' && method.toUpperCase() !== 'HEAD' ? body : undefined) : undefined,
+            maxRedirections: MAX_REDIRECTS,
+            headersTimeout: requestTimeout, // Timeout for receiving headers
+            bodyTimeout: requestTimeout, // Timeout for receiving the body
+            // TODO: Add more options if needed (e.g., custom agent for proxy)
+        });
+
+        console.log(`[${jobId}] Received status code: ${statusCode}`);
+
+        // Read the response body into a buffer
+        const chunks: Buffer[] = []; // Explicitly type chunks as Buffer[]
+        for await (const chunk of responseBodyStream) {
+            chunks.push(Buffer.from(chunk)); // Ensure chunk is treated as Buffer
+        }
+        const responseBodyBuffer = Buffer.concat(chunks);
+
+        // TODO: Implement response formatting (Subtask 5.3)
+        sendSuccessResponse(requestId, jobId, statusCode, responseHeaders as Record<string, string>, responseBodyBuffer);
+
+    } catch (error: any) {
+        console.error(`[${jobId}] Error executing HTTP request:`, error.message);
+        sendErrorResponse(requestId, jobId, `HTTP request failed: ${error.message}`, error.statusCode);
+    }
+}
+
+function sendSuccessResponse(requestId: string | undefined, jobId: string, statusCode: number, headers: Record<string, string>, body: Buffer) {
+    // Determine if body should be Base64 encoded (e.g., based on content-type or just default to it)
+    // Simple approach: Assume binary if content-type suggests it, or if it's not easily identified as text.
+    // More robust: Check content-type for known text types (text/*, application/json, application/xml, etc.)
+    const contentType = headers['content-type']?.toLowerCase() || '';
+    const isTextBased = contentType.startsWith('text/') || contentType.includes('json') || contentType.includes('xml') || contentType.includes('javascript');
+
+    const responseBody = isTextBased ? body.toString('utf8') : body.toString('base64');
+    const isBase64Encoded = !isTextBased;
+
+    const responseMessage = {
+        action: 'job_response',
+        requestId: requestId, // Include original request ID if available
+        data: {
+            jobId: jobId,
+            status: 'success',
+            result: {
+                statusCode: statusCode,
+                headers: headers,
+                body: responseBody,
+                isBase64Encoded: isBase64Encoded
+            }
+        }
+    };
+    sendMessage(responseMessage);
+}
+
+function sendErrorResponse(requestId: string | undefined, jobId: string | undefined, error: string, statusCode?: number) {
+    const responseMessage = {
+        action: 'job_response',
+        requestId: requestId,
+        data: {
+            jobId: jobId || 'unknown',
+            status: 'failure',
+            error: {
+                message: error,
+                statusCode: statusCode
+            }
+        }
+    };
+    sendMessage(responseMessage);
+}
+
+// Utility to send messages
+function sendMessage(message: BaseMessage) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        try {
+            const messageString = JSON.stringify(message);
+            console.log(`	🚀 Sending message: ${message.action}`);
+            ws.send(messageString);
+        } catch (err: any) { // Use 'any' or a more specific error type
+            console.error('Error stringifying or sending message:', err.message);
+        }
+    } else {
+        console.error(`Cannot send message, WebSocket not open or not initialized. Action: ${message.action}`);
+    }
 }
 
 // Initial connection attempt
