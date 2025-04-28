@@ -1,8 +1,8 @@
 import { SQSEvent, SQSHandler } from 'aws-lambda';
 import { DynamoDBClient, PutItemCommand, UpdateItemCommand } from '@aws-sdk/client-dynamodb';
-import { ApiGatewayManagementApiClient, PostToConnectionCommand } from '@aws-sdk/client-apigatewaymanagementapi'; // Corrected import
+import { ApiGatewayManagementApiClient, PostToConnectionCommand, GoneException } from '@aws-sdk/client-apigatewaymanagementapi'; // Import GoneException
 import { marshall } from '@aws-sdk/util-dynamodb';
-import { findAvailableAgent, markAgentAsBusy, markAgentAsAvailable } from '../utils/agent-registry'; // Import correct utils
+import { findAvailableAgent, markAgentAsBusy, deleteAgentConnection } from '../utils/agent-registry'; // Import correct utils
 import { JobData } from '../utils/types';
 
 const AGENT_REGISTRY_TABLE_NAME = process.env.AGENT_REGISTRY_TABLE_NAME;
@@ -49,30 +49,29 @@ export const handler: SQSHandler = async (event: SQSEvent) => {
 
             // 2. Find available agent
             console.log(`Finding available agent for job ${jobId}...`);
-            const agent = await findAvailableAgent(); // Implement this utility
+            const agent = await findAvailableAgent(); 
             if (!agent || !agent.connectionId) {
-                // TODO: Handle no available agent - requeue message? Send to DLQ?
-                console.error(`No available agents found for job ${jobId}. Message ID: ${record.messageId}. Needs requeue/DLQ logic.`);
-                // For now, just log and skip
-                 continue; 
+                // Throw error to let SQS handle retry/DLQ
+                console.error(`No available agents found for job ${jobId}. Message ID: ${record.messageId}. Triggering retry/DLQ.`);
+                throw new Error(`No available agents found for job ${jobId}`); 
             }
             console.log(`Found available agent ${agent.agentId} (${agent.connectionId}) for job ${jobId}`);
 
             // 3. Mark agent busy
             console.log(`Marking agent ${agent.agentId} as busy with job ${jobId}`);
-            const markedBusy = await markAgentAsBusy(agent.connectionId, jobId); // Use correct function
+            const markedBusy = await markAgentAsBusy(agent.connectionId, jobId);
             if (!markedBusy) {
-                // TODO: Handle failure to mark busy - potential race condition? Retry find agent?
-                console.error(`Failed to mark agent ${agent.agentId} (${agent.connectionId}) as busy for job ${jobId}. Skipping dispatch.`);
-                 continue; 
+                // Throw error to let SQS handle retry/DLQ (likely condition check failed)
+                console.error(`Failed to mark agent ${agent.agentId} (${agent.connectionId}) as busy for job ${jobId}. Triggering retry/DLQ.`);
+                throw new Error(`Failed to mark agent ${agent.agentId} as busy`); 
             }
 
             // 4. Send job to agent via WebSocket
             const payloadToSend = {
-                action: 'execute_job', // Define the action for the agent
+                action: 'execute_job', 
                 data: {
-                    ...agentJobPayload, // Contains url, method, headers, body, etc.
-                    jobId: jobId, // Send jobId so agent can include it in response
+                    ...agentJobPayload,
+                    jobId: jobId, 
                     timeoutMs: timeoutMs || 30000,
                 },
             };
@@ -85,20 +84,20 @@ export const handler: SQSHandler = async (event: SQSEvent) => {
                 console.log(`Successfully sent job ${jobId} to agent ${agent.agentId}`);
             } catch (error: any) {
                  console.error(`Failed to send job ${jobId} to agent ${agent.connectionId}:`, error);
-                 // If GoneException, agent disconnected between find and send.
-                 // Need to mark agent as potentially disconnected and retry dispatching the job.
-                 if (error.name === 'GoneException') {
-                    console.warn(`Agent ${agent.connectionId} disconnected before receiving job ${jobId}. Attempting to handle...`);
-                    // TODO: Implement logic to handle GoneException 
-                    // - Remove/update agent status in registry
-                    // - Requeue the SQS message for retry
+                 // If GoneException, agent disconnected between find/mark and send.
+                 if (error instanceof GoneException) { // Use instanceof for type check
+                    console.warn(`Agent ${agent.connectionId} disconnected before receiving job ${jobId}. Cleaning up registry.`);
+                    // Attempt to clean up the registry entry
+                    await deleteAgentConnection(agent.connectionId);
+                    console.log(`Triggering SQS retry/DLQ for job ${jobId} due to GoneException.`);
+                    // Re-throw the error to trigger SQS retry/DLQ
+                    throw error; 
                  } else {
-                    // Other error sending to agent - might need retry or DLQ
-                    // Mark agent available again? Or potentially problematic?
-                    await markAgentAsAvailable(agent.connectionId); // Use correct function, revert status on send failure? Risky.
+                    // Other error sending to agent - don't mark agent available, just trigger retry/DLQ
+                    console.error(`Other error sending job ${jobId} to agent ${agent.connectionId}. Triggering SQS retry/DLQ.`);
+                    // Re-throw the error to trigger SQS retry/DLQ
+                    throw error;
                  }
-                 // Re-throw or handle to prevent SQS message deletion? Depends on retry strategy.
-                 throw error; // Re-throw for now to let SQS handle retry/DLQ based on queue config
             }
 
         } catch (error: any) {

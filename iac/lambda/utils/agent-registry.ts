@@ -1,4 +1,4 @@
-import { DynamoDBClient, QueryCommand, UpdateItemCommand, ReturnValue } from '@aws-sdk/client-dynamodb';
+import { DynamoDBClient, QueryCommand, UpdateItemCommand, ReturnValue, DeleteItemCommand } from '@aws-sdk/client-dynamodb';
 import { marshall, unmarshall } from '@aws-sdk/util-dynamodb';
 import { AgentInfo } from './types';
 
@@ -111,5 +111,30 @@ export async function markAgentAsAvailable(connectionId: string): Promise<boolea
     } catch (error) {
         console.error(`Error marking agent ${connectionId} as available:`, error);
         return false;
+    }
+}
+
+/**
+ * Deletes an agent connection record from the registry.
+ * Useful when a connection is confirmed to be gone (e.g., GoneException).
+ */
+export async function deleteAgentConnection(connectionId: string): Promise<boolean> {
+    if (!TABLE_NAME) {
+        console.error('AGENT_REGISTRY_TABLE_NAME environment variable not set.');
+        return false;
+    }
+
+    try {
+        const params = {
+            TableName: TABLE_NAME,
+            Key: marshall({ connectionId }),
+            // Optional: ConditionExpression: 'attribute_exists(connectionId)'
+        };
+        await dynamoDb.send(new DeleteItemCommand(params)); // Use DeleteItemCommand
+        console.log(`Successfully deleted agent connection record ${connectionId}`);
+        return true;
+    } catch (error) {
+        console.error(`Error deleting agent connection record ${connectionId}:`, error);
+        return false; // Indicate failure
     }
 } 
