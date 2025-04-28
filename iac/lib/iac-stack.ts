@@ -58,6 +58,7 @@ export class OrchestratorStack extends cdk.Stack {
       partitionKey: { name: 'connectionId', type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
+      timeToLiveAttribute: 'ttl',
     });
 
     // --- Lambda Functions ---
@@ -68,7 +69,7 @@ export class OrchestratorStack extends cdk.Stack {
       runtime: lambda.Runtime.NODEJS_LATEST,
       role: webSocketHandlerRole,
       environment: {
-        AGENT_KEYS_SECRET_NAME: agentApiKeysSecret.secretName,
+        AGENT_API_KEYS_SECRET_ARN: agentApiKeysSecret.secretArn,
         AGENT_REGISTRY_TABLE_NAME: agentRegistryTable.tableName,
       },
     });
@@ -114,7 +115,6 @@ export class OrchestratorStack extends cdk.Stack {
       apiName: 'ResidentialProxyWebSocketApi',
       description: 'WebSocket API for Distributed Residential Proxy System',
       routeSelectionExpression: '$request.body.action',
-      // Define connect/disconnect routes directly for cleaner integration setup
       connectRouteOptions: { integration: new WebSocketLambdaIntegration('ConnectIntegration', connectHandler) },
       disconnectRouteOptions: { integration: new WebSocketLambdaIntegration('DisconnectIntegration', disconnectHandler) },
     });
@@ -125,13 +125,53 @@ export class OrchestratorStack extends cdk.Stack {
     });
 
     // --- Deployment Stage ---
+    const stage = new WebSocketStage(this, 'DevStage', {
+      webSocketApi,
+      stageName: 'dev',
+      autoDeploy: true,
+      // NOTE: Logging/throttling are configured on the underlying CfnStage
+    });
+
+    // Access the underlying CfnStage
+    const cfnStage = stage.node.defaultChild as CfnStage;
 
     // Create a log group for API Gateway access logs
     const wsApiAccessLogGroup = new logs.LogGroup(this, 'WebSocketApiAccessLogGroup', {
-      logGroupName: '/aws/apigateway/ResidentialProxyWebSocketApi-access',
+      logGroupName: `/aws/apigateway/${webSocketApi.apiId}/${stage.stageName}/access`,
       retention: logs.RetentionDays.ONE_WEEK,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
+
+    // Configure Access Logging on CfnStage
+    cfnStage.accessLogSettings = {
+      destinationArn: wsApiAccessLogGroup.logGroupArn,
+      format: JSON.stringify({
+        requestId: '$context.requestId',
+        ip: '$context.identity.sourceIp',
+        caller: '$context.identity.caller',
+        user: '$context.identity.user',
+        requestTime: '$context.requestTime',
+        // httpMethod: '$context.httpMethod', // Not standard for WebSocket
+        // resourcePath: '$context.resourcePath', // Not standard for WebSocket
+        status: '$context.status',
+        protocol: '$context.protocol',
+        responseLength: '$context.responseLength',
+        connectionId: '$context.connectionId',
+        connectedAt: '$context.connectedAt',
+        eventType: '$context.eventType',
+        routeKey: '$context.routeKey',
+        domainName: '$context.domainName',
+        apiId: '$context.apiId'
+      }),
+    };
+
+    // Configure Execution Logging and Metrics on CfnStage
+    cfnStage.defaultRouteSettings = {
+        loggingLevel: 'INFO', // Set desired logging level
+        dataTraceEnabled: true, // Log full request/response data
+        detailedMetricsEnabled: true, // Enable CloudWatch metrics
+        // Throttling settings will use defaults if not specified here
+    } as CfnStage.RouteSettingsProperty;
 
     // --- IAM Role for API Gateway Logging ---
     const apiGwLogsRole = new iam.Role(this, 'ApiGatewayLogsRole', {
@@ -153,7 +193,7 @@ export class OrchestratorStack extends cdk.Stack {
 
     // WebSocket API endpoint format: wss://{apiId}.execute-api.{region}.amazonaws.com/{stageName}
     new cdk.CfnOutput(this, 'WebSocketApiEndpoint', {
-      value: `wss://${webSocketApi.apiId}.execute-api.${this.region}.amazonaws.com/dev`,
+      value: stage.url,
       description: 'The URL of the WebSocket API endpoint',
     });
 
@@ -166,6 +206,11 @@ export class OrchestratorStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'ApiGatewayLogsRoleArn', {
       value: apiGwLogsRole.roleArn,
       description: 'ARN of the IAM Role used by API Gateway to push logs to CloudWatch',
+    });
+
+    new cdk.CfnOutput(this, 'WebSocketAccessLogGroup', {
+        value: wsApiAccessLogGroup.logGroupName,
+        description: 'CloudWatch Log Group for WebSocket Access Logs',
     });
   }
 }

@@ -49,4 +49,4 @@ alwaysApply: true
   - Include both DO and DON'T examples
   - Reference actual code over theoretical examples
   - Use consistent formatting across rules 
-  - Use Git
+  - Use Git, always commit after you done task or subtask

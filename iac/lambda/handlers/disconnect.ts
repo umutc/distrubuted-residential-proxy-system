@@ -8,12 +8,12 @@ export const handler = async (event: APIGatewayProxyWebsocketEventV2): Promise<A
   console.log(`Disconnect invoked for connection: ${connectionId}`);
 
   const dynamo = new DynamoDBClient({});
-  const AGENT_REGISTRY_TABLE = process.env.AGENT_REGISTRY_TABLE || 'distributed-res-proxy-agent-registry';
+  const AGENT_REGISTRY_TABLE_NAME = process.env.AGENT_REGISTRY_TABLE_NAME || 'distributed-res-proxy-agent-registry';
 
   // Remove agent from registry
   try {
     await dynamo.send(new DeleteItemCommand({
-      TableName: AGENT_REGISTRY_TABLE,
+      TableName: AGENT_REGISTRY_TABLE_NAME,
       Key: {
         connectionId: { S: connectionId },
       },
