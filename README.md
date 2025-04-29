@@ -18,10 +18,10 @@ This project is managed using [Task Master](README-task-master.md) for AI-driven
 
 ## 📊 Progress
 
-**Overall MVP Completion: 70%**
+**Overall MVP Completion: ~75%**
 
 ```
-[█████████████░░░░░░░] 70% 
+[███████████████░░░░░] 75% 
 ```
 *(Based on Task Master task statuses)*
 
@@ -35,11 +35,12 @@ This project is managed using [Task Master](README-task-master.md) for AI-driven
     -   ✅ Task 5: Implement HTTP request execution in Agent
     -   ✅ Task 6: Implement job response handling in Orchestrator
     -   ✅ Task 7: Develop Job Ingestion API endpoint
+    -   ✅ Task 8: Implement synchronous job request/response flow (MVP level)
+    -   ✅ Task 10: Implement comprehensive error handling and logging (Subtasks 10.1-10.5, 10.7-10.9 completed)
 
 -   **Current Priorities:**
-    -   ⏱️ Task 8: Implement synchronous job request/response flow
     -   ⏱️ Task 9: Create basic agent monitoring endpoint
-    -   ⏱️ Task 10: Implement job timeout mechanism
+    -   ⏱️ Task 10: Remaining subtasks (retry enhancements, shutdown logic, metrics, docs, tests)
 
 ## Core Features (MVP)
 
@@ -47,11 +48,19 @@ This project is managed using [Task Master](README-task-master.md) for AI-driven
 -   **Job Distribution:** The Orchestrator receives HTTP request jobs (URL, method, headers, body) via an internal API.
 -   **Job Execution:** The Orchestrator assigns jobs to available, authenticated Agents, marking them as busy. Agents execute the HTTP(S) requests using their residential IP address and follow redirects.
 -   **Response Handling:** Agents return the response (status, headers, Base64-encoded body) or error to the Orchestrator via WebSocket.
--   **Synchronous API:** The Orchestrator provides a synchronous API for internal services to submit jobs and receive proxied responses.
--   **Agent Management:** Basic tracking of connected agents and their status (available/busy) within the Orchestrator.
--   -   Lambda handlers use the `AGENT_REGISTRY_TABLE_NAME` environment variable to locate the agent registry DynamoDB table.
+-   **Synchronous API:** The Orchestrator provides a synchronous API (`POST /jobs?sync=true`) for internal services to submit jobs and receive proxied responses directly, waiting for completion.
+-   **Health Check:** An HTTP endpoint (`GET /health`) on the Orchestrator to verify the status of core dependencies (DynamoDB tables, SQS queue).
+-   **CloudWatch Metrics:** Basic metrics for synchronous job duration and success/failure/timeout status (`SynchronousJobDuration`, `SynchronousJobResult`) are published to CloudWatch under the `DistributedResidentialProxy` namespace.
+-   **Resilience:** 
+    -   Main job queue includes a Dead Letter Queue (DLQ).
+    -   Basic retry logic for transient errors in the Orchestrator (e.g., no available agents).
+-   **Agent Management:** Basic tracking of connected agents and their status (available/busy, basic health via status updates) within the Orchestrator.
+-   **Structured Logging:** JSON-based structured logging implemented in both Agent and Orchestrator using Pino for better observability.
+-   **Error Handling:** Defined error codes and enhanced error handling/logging across components.
 -   **Configuration:** Agent configuration (Orchestrator URL, API Key) managed via environment variables.
--   **Monitoring:** Basic API endpoint on the Orchestrator to list connected agents.
+-   **Monitoring:** 
+    -   Basic API endpoint on the Orchestrator to list connected agents.
+    -   Agent periodically sends status updates to Orchestrator.
 -   **Timeout Handling:** Orchestrator implements timeouts for jobs sent to agents.
 
 ## Architecture Overview
@@ -86,7 +95,7 @@ The system consists of two main components:
     -   Navigate to the root `/iac` directory: `cd iac`.
     -   Install CDK dependencies: `npm install`.
     -   Configure AWS credentials for your target account/region.
-    -   Deploy the stack: `cdk deploy`.
+    -   Deploy the stack: `cd iac && cdk deploy --require-approval never`. *Note: This command deploys all infrastructure, including Lambdas, API Gateways, SQS Queues, and DynamoDB tables.*
     -   The deployment outputs will include the Orchestrator WebSocket URL (`wss://...`) and the Job Ingestion HTTP API endpoint (`https://...`).
     -   Configure secure storage for Agent API keys (e.g., AWS Secrets Manager) - the stack creates a secret named `distributed-res-proxy-agent-keys`.
     -   Add API keys for your agents to the `distributed-res-proxy-agent-keys` secret in AWS Secrets Manager.
@@ -97,40 +106,79 @@ The system consists of two main components:
     -   Install dependencies: `npm install`.
     -   Create a `.env` file in the `/agent` directory with:
         ```dotenv
-        ORCH_WS=wss://your-orchestrator-websocket-url-from-cdk-output
+        ORCH_WS=wss://your-orchestrator-websocket-url-from-cdk-output # e.g., wss://g0u8826061.execute-api.us-west-2.amazonaws.com/dev
         AGENT_KEY=your-provisioned-agent-api-key-from-secrets-manager
+        AGENT_GRACE_PERIOD_MS=10000 # Optional: Grace period in ms for shutdown (default: 10000)
         ```
-    -   Run the Agent: `node dist/agent.js` (assuming a build step, or `ts-node src/agent.ts` for development).
+    -   Build the agent (if needed): `npm run build`
+    -   Run the Agent: `node dist/agent.js`.
 
 ## Usage
 
-1.  **Running the Agent:** Once configured, start the Agent application on the operator's machine (`node dist/agent.js`). It will connect to the Orchestrator and become available for jobs. Logs will indicate connection status.
+1.  **Running the Agent:** Ensure the Orchestrator is deployed and the agent's `.env` file is configured correctly. Start the Agent application (`cd agent && node dist/agent.js`). It must be running and connected for jobs to be processed.
 
-2.  **Submitting Jobs (Internal Services):** Internal services interact with the Orchestrator's job ingestion API (covered in Task 7 & 8). The API endpoint (e.g., `POST /jobs`) will accept a JSON payload like:
-    ```json
-    {
-      "url": "https://example.com",
-      "method": "GET",
-      "headers": { "User-Agent": "MyApp/1.0" },
-      "body": null // or Base64 encoded string for POST/PUT
-    }
+2.  **Submitting Jobs (Internal Services):**
+    *   **Asynchronous (Recommended for non-interactive tasks):** Send a `POST` request to the Job Ingestion API endpoint (e.g., `https://your-http-api-id.execute-api.{region}.amazonaws.com/jobs`). The API will return `202 Accepted` with a `jobId`. Results must be retrieved separately (mechanism TBD post-MVP).
+        ```bash
+        curl -X POST https://{api-id}.execute-api.{region}.amazonaws.com/jobs \
+             -H "Content-Type: application/json" \
+             -d '{"url": "https://httpbin.org/delay/1", "method": "GET"}'
+        ```
+    *   **Synchronous:** Send a `POST` request to the same endpoint but include the query parameter `?sync=true`. The API will hold the connection open and return the proxied response (or an error/timeout) directly.
+        ```bash
+        curl -X POST "https://{api-id}.execute-api.{region}.amazonaws.com/jobs?sync=true" \
+             -H "Content-Type: application/json" \
+             -d '{"url": "https://httpbin.org/get", "method": "GET"}'
+
+        # Example Success Response (Body contains JSON string)
+        # {
+        #   "message": "Job completed successfully.",
+        #   "jobId": "...",
+        #   "requestId": "...",
+        #   "result": {
+        #     "statusCode": 200,
+        #     "headers": { ... },
+        #     "body": "eyJhcmdzIj...", // Base64 encoded
+        #     "isBase64Encoded": true
+        #   }
+        # }
+
+        # Example Timeout Response
+        # {
+        #   "message": "Request timed out waiting for job completion.",
+        #   "jobId": "...",
+        #   "requestId": "..."
+        # }
+        ```
+
+3.  **Health Check:** Send a `GET` request to the `/health` endpoint of the HTTP API.
+    ```bash
+    curl https://{api-id}.execute-api.{region}.amazonaws.com/health
+    # Example Response: {"status":"healthy","checks":{"AgentRegistryTable":"OK","SyncJobMappingTable":"OK"}}
     ```
-    The API will synchronously return the proxied response:
-    ```json
-    {
-      "statusCode": 200,
-      "headers": { "content-type": "text/html; charset=UTF-8", ... },
-      "body": "PGh0bWw+..." // Base64 encoded body
-    }
-    ```
-    Or an error object if the job fails or times out.
 
-3.  **Monitoring:** Query the Orchestrator's monitoring endpoint (e.g., `GET /agents`) to see a list of connected agents and their status (covered in Task 9).
+4.  **Monitoring:**
+    *   Check CloudWatch Logs for Lambda functions (`ConnectHandler`, `DisconnectHandler`, `DefaultHandler`, `JobIngestionHandler`, `OrchestratorDispatcherHandler`, `HealthCheckHandler`).
+    *   Check CloudWatch Metrics in the `DistributedResidentialProxy` namespace for `SynchronousJobDuration` and `SynchronousJobResult`.
+    *   Monitor the `OrchestratorInputDLQ` SQS queue for messages that failed processing repeatedly.
 
-4.  **Task Management (Development):**
+5.  **Agent Monitoring:** Query the Orchestrator's monitoring endpoint (e.g., `GET /agents`) to see a list of connected agents and their status (covered in Task 9).
+
+6.  **Task Management (Development):**
     -   This project uses [Task Master](README-task-master.md) for managing development tasks.
     -   Use `task-master list` or `task-master next` (or the corresponding MCP tools in Cursor) to view and manage tasks.
     -   See `README-task-master.md` for detailed Task Master commands and workflow.
+
+## Integration Testing
+
+-   Integration tests using Jest are located in `iac/test/integration.test.ts`.
+-   These tests interact with the *deployed* HTTP API endpoint.
+-   **Crucially, a live agent must be running and connected to the deployed WebSocket endpoint for the synchronous tests to pass.**
+-   To run the tests:
+    ```bash
+    cd iac
+    npm run test -- integration.test.ts
+    ```
 
 ## Contributing
 
