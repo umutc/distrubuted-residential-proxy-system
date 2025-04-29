@@ -29,23 +29,34 @@ export class OrchestratorStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    // --- IAM Role for WebSocket Handlers ---
-    const webSocketHandlerRole = new iam.Role(this, 'WebSocketHandlerRole', {
+    // --- Shared IAM Role for Lambda Handlers ---
+    // (Consolidated role definition for simplicity)
+    const lambdaHandlerRole = new iam.Role(this, 'OrchestratorLambdaHandlerRole', {
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
       managedPolicies: [
-        // Basic execution policy
         iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole'),
       ],
     });
 
-    // Add policy to manage WebSocket connections
-    webSocketHandlerRole.addToPolicy(new iam.PolicyStatement({
+    // Allow managing WebSocket connections
+    lambdaHandlerRole.addToPolicy(new iam.PolicyStatement({
       effect: iam.Effect.ALLOW,
       actions: ['execute-api:ManageConnections'],
-      resources: [`arn:aws:execute-api:${this.region}:${this.account}:*/*`], // Adjust scope as needed
+      resources: [`arn:aws:execute-api:${this.region}:${this.account}:*/*`], // Broad for now
     }));
 
-    // TODO: Add DynamoDB permissions later (Task 2)
+    // Allow SQS access (send/receive/delete for temporary queues)
+    lambdaHandlerRole.addToPolicy(new iam.PolicyStatement({
+      actions: [
+        'sqs:SendMessage',
+        'sqs:ReceiveMessage',
+        'sqs:DeleteMessage',
+        'sqs:GetQueueAttributes',
+        'sqs:CreateQueue', // Needed for sync flow temporary queues
+        'sqs:DeleteQueue', // Needed for sync flow temporary queues
+      ],
+      resources: ['*'], // Restrict in production if possible
+    }));
 
     // --- Agent API Keys Secret ---
     const agentApiKeysSecret = new secretsmanager.Secret(this, 'AgentApiKeysSecret', {
@@ -71,29 +82,19 @@ export class OrchestratorStack extends cdk.Stack {
     agentRegistryTable.addGlobalSecondaryIndex({
       indexName: 'StatusIndex',
       partitionKey: { name: 'status', type: dynamodb.AttributeType.STRING },
-      // Optionally add a sort key if needed for further filtering, e.g., updatedAt
-      // sortKey: { name: 'updatedAt', type: dynamodb.AttributeType.STRING },
-      projectionType: dynamodb.ProjectionType.ALL, // Adjust as needed for query efficiency
+      projectionType: dynamodb.ProjectionType.ALL,
     });
+    // Grant read/write permissions to the shared role
+    agentRegistryTable.grantReadWriteData(lambdaHandlerRole);
 
-    // --- Job Repository DynamoDB Table (Placeholder for now) ---
-    // Future Task: Define schema and enable this table
-    /*
-    const jobRepositoryTable = new dynamodb.Table(this, 'JobRepositoryTable', {
-      tableName: 'distributed-res-proxy-job-repository',
-      partitionKey: { name: 'jobId', type: dynamodb.AttributeType.STRING },
-      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
-      removalPolicy: cdk.RemovalPolicy.DESTROY, // Adjust for production
-      // timeToLiveAttribute: 'ttl', // Consider TTL for jobs
-    });
-    */
+    // --- Job Repository DynamoDB Table (Placeholder) ---
+    // ... (commented out)
 
     // --- Dead Letter Queue for Orchestrator Input ---
     const orchestratorInputDLQ = new sqs.Queue(this, 'OrchestratorInputDLQ', {
       queueName: `OrchestratorInputDLQ-${this.stackName}.fifo`,
       fifo: true,
       retentionPeriod: cdk.Duration.days(14),
-      // Consider adding alarms on this queue
     });
 
     // --- Orchestrator Input SQS Queue (FIFO) ---
@@ -108,27 +109,40 @@ export class OrchestratorStack extends cdk.Stack {
         maxReceiveCount: 5,
       },
     });
+    // Grant send permissions to the shared role (for job ingestion)
+    orchestratorInputQueue.grantSendMessages(lambdaHandlerRole);
+    // Grant consume permissions to the shared role (for dispatcher)
+    orchestratorInputQueue.grantConsumeMessages(lambdaHandlerRole);
 
     // --- Sync Job Mapping DynamoDB Table ---
     const syncJobMappingTable = new dynamodb.Table(this, 'SyncJobMappingTable', {
         tableName: 'distributed-res-proxy-sync-job-map',
         partitionKey: { name: 'jobId', type: dynamodb.AttributeType.STRING },
         billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
-        removalPolicy: cdk.RemovalPolicy.DESTROY, // Adjust for production
-        timeToLiveAttribute: 'ttl', // Enable TTL based on an attribute named 'ttl'
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+        timeToLiveAttribute: 'ttl',
     });
+    // Grant read/write permissions to the shared role
+    syncJobMappingTable.grantReadWriteData(lambdaHandlerRole);
 
-    // --- Lambda Functions ---
+    // --- Lambda Functions Environment Variables ---
+    const lambdaEnvironment = {
+      AGENT_API_KEYS_SECRET_ARN: agentApiKeysSecret.secretArn,
+      AGENT_REGISTRY_TABLE_NAME: agentRegistryTable.tableName,
+      ORCHESTRATOR_QUEUE_URL: orchestratorInputQueue.queueUrl,
+      SYNC_JOB_MAPPING_TABLE_NAME: syncJobMappingTable.tableName,
+      WEBSOCKET_API_ENDPOINT: '' // This will be set later after WebSocket API is created
+      // JOB_REPOSITORY_TABLE_NAME: jobRepositoryTable.tableName, // Uncomment when job repo is added
+    };
+
+    // --- Lambda Function Definitions ---
 
     const connectHandler = new lambda_nodejs.NodejsFunction(this, 'ConnectHandler', {
       entry: path.join(__dirname, '../lambda/handlers/connect.ts'),
       handler: 'handler',
       runtime: lambda.Runtime.NODEJS_LATEST,
-      role: webSocketHandlerRole,
-      environment: {
-        AGENT_API_KEYS_SECRET_ARN: agentApiKeysSecret.secretArn,
-        AGENT_REGISTRY_TABLE_NAME: agentRegistryTable.tableName,
-      },
+      role: lambdaHandlerRole, // Use shared role
+      environment: lambdaEnvironment,
     });
     new logs.LogGroup(this, 'ConnectHandlerLogGroup', {
       logGroupName: `/aws/lambda/${connectHandler.functionName}`,
@@ -140,7 +154,8 @@ export class OrchestratorStack extends cdk.Stack {
       entry: path.join(__dirname, '../lambda/handlers/disconnect.ts'),
       handler: 'handler',
       runtime: lambda.Runtime.NODEJS_LATEST,
-      role: webSocketHandlerRole,
+      role: lambdaHandlerRole, // Use shared role
+      environment: lambdaEnvironment,
     });
     new logs.LogGroup(this, 'DisconnectHandlerLogGroup', {
       logGroupName: `/aws/lambda/${disconnectHandler.functionName}`,
@@ -152,17 +167,60 @@ export class OrchestratorStack extends cdk.Stack {
       entry: path.join(__dirname, '../lambda/handlers/default.ts'),
       handler: 'handler',
       runtime: lambda.Runtime.NODEJS_LATEST,
-      role: webSocketHandlerRole,
-      environment: {
-        AGENT_REGISTRY_TABLE_NAME: agentRegistryTable.tableName,
-        SYNC_JOB_MAPPING_TABLE_NAME: syncJobMappingTable.tableName, // <-- Add Sync Map Table Name
-      },
+      role: lambdaHandlerRole, // Use shared role
+      environment: lambdaEnvironment,
     });
     new logs.LogGroup(this, 'DefaultHandlerLogGroup', {
       logGroupName: `/aws/lambda/${defaultHandler.functionName}`,
       retention: logs.RetentionDays.ONE_WEEK,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
+
+    const jobIngestionHandler = new lambda_nodejs.NodejsFunction(this, 'JobIngestionHandler', {
+      entry: path.join(__dirname, '../lambda/handlers/job-ingestion.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_LATEST,
+      role: lambdaHandlerRole, // Use shared role
+      environment: lambdaEnvironment,
+    });
+    new logs.LogGroup(this, 'JobIngestionHandlerLogGroup', {
+      logGroupName: `/aws/lambda/${jobIngestionHandler.functionName}`,
+      retention: logs.RetentionDays.ONE_WEEK,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    const orchestratorDispatcherHandler = new lambda_nodejs.NodejsFunction(this, 'OrchestratorDispatcherHandler', {
+      entry: path.join(__dirname, '../lambda/handlers/orchestrator-dispatcher.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_LATEST,
+      role: lambdaHandlerRole, // Use shared role
+      environment: lambdaEnvironment,
+    });
+    // Add SQS event source
+    orchestratorDispatcherHandler.addEventSource(new SqsEventSource(orchestratorInputQueue, {
+        batchSize: 10, // Adjust as needed
+        reportBatchItemFailures: true, // Important for error handling
+    }));
+    new logs.LogGroup(this, 'OrchestratorDispatcherLogGroup', {
+        logGroupName: `/aws/lambda/${orchestratorDispatcherHandler.functionName}`,
+        retention: logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    // <<< START: Add Metrics Handler >>>
+    const metricsHandler = new lambda_nodejs.NodejsFunction(this, 'MetricsHandler', {
+      entry: path.join(__dirname, '../lambda/handlers/metrics.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_LATEST,
+      role: lambdaHandlerRole, // Basic execution role is likely sufficient
+      environment: lambdaEnvironment, // Pass environment just in case (though not strictly needed now)
+    });
+    new logs.LogGroup(this, 'MetricsHandlerLogGroup', {
+      logGroupName: `/aws/lambda/${metricsHandler.functionName}`,
+      retention: logs.RetentionDays.ONE_WEEK,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+    // <<< END: Add Metrics Handler >>>
 
     // --- WebSocket API Gateway ---
     const webSocketApi = new apigwv2.WebSocketApi(this, 'ResidentialProxyWebSocketApi', {
@@ -172,8 +230,6 @@ export class OrchestratorStack extends cdk.Stack {
       connectRouteOptions: { integration: new WebSocketLambdaIntegration('ConnectIntegration', connectHandler) },
       disconnectRouteOptions: { integration: new WebSocketLambdaIntegration('DisconnectIntegration', disconnectHandler) },
     });
-
-    // Add default route separately
     webSocketApi.addRoute('$default', {
       integration: new WebSocketLambdaIntegration('DefaultIntegration', defaultHandler),
     });
@@ -183,7 +239,11 @@ export class OrchestratorStack extends cdk.Stack {
       webSocketApi,
       stageName: 'dev',
       autoDeploy: true,
-      // NOTE: Logging/throttling are configured on the underlying CfnStage
+    });
+    // Update Lambda environment with the final WebSocket URL
+    const webSocketUrl = stage.url;
+    [connectHandler, disconnectHandler, defaultHandler, jobIngestionHandler, orchestratorDispatcherHandler, metricsHandler].forEach(handler => {
+         handler.addEnvironment('WEBSOCKET_API_ENDPOINT', webSocketUrl);
     });
 
     // Access the underlying CfnStage
@@ -231,167 +291,73 @@ export class OrchestratorStack extends cdk.Stack {
     const httpApi = new apigw_http.HttpApi(this, 'JobIngestionHttpApi', {
         apiName: 'ResidentialProxyJobIngestionApi',
         description: 'HTTP API for submitting proxy jobs',
-        corsPreflight: { // Configure CORS if needed for browser clients
-            allowHeaders: ['Content-Type', 'X-Amz-Date', 'Authorization', 'X-Api-Key'],
-            allowMethods: [apigw_http.CorsHttpMethod.POST, apigw_http.CorsHttpMethod.OPTIONS],
-            allowOrigins: ['*'], // Restrict in production
+        corsPreflight: { 
+            allowHeaders: ['*'], // More permissive for now
+            allowMethods: [apigw_http.CorsHttpMethod.POST, apigw_http.CorsHttpMethod.GET, apigw_http.CorsHttpMethod.OPTIONS],
+            allowOrigins: ['*'],
         },
-        // Default stage is created automatically
     });
 
-    // Define Job Ingestion Lambda *after* stage is defined to access stage.url
-    const jobIngestionHandler = new lambda_nodejs.NodejsFunction(this, 'JobIngestionHandler', {
-      entry: path.join(__dirname, '../lambda/handlers/job-ingestion.ts'),
-      handler: 'handler',
-      runtime: lambda.Runtime.NODEJS_LATEST,
-      role: webSocketHandlerRole, // Reuse role for now
-      environment: {
-        AGENT_REGISTRY_TABLE_NAME: agentRegistryTable.tableName,
-        WEBSOCKET_API_ENDPOINT: stage.url, // Pass WebSocket URL to the handler
-        ORCHESTRATOR_QUEUE_URL: orchestratorInputQueue.queueUrl, // <-- Add Orchestrator Queue URL
-        SYNC_JOB_MAPPING_TABLE_NAME: syncJobMappingTable.tableName, // <-- Add Sync Map Table Name
-        // JOB_REPOSITORY_TABLE_NAME: jobRepositoryTable.tableName, // Add when table is enabled
-      },
-    });
-    new logs.LogGroup(this, 'JobIngestionHandlerLogGroup', {
-      logGroupName: `/aws/lambda/${jobIngestionHandler.functionName}`,
-      retention: logs.RetentionDays.ONE_WEEK,
-      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    // Add routes to HTTP API
+    httpApi.addRoutes({
+      path: '/jobs',
+      methods: [ apigw_http.HttpMethod.POST ],
+      integration: new HttpLambdaIntegration('JobIngestionIntegration', jobIngestionHandler),
     });
 
-    // Grant JobIngestionHandler SQS permissions for temporary queues
-    const sqsJobIngestionPermissionStatement = new iam.PolicyStatement({
-      actions: [
-        'sqs:CreateQueue',
-        'sqs:DeleteQueue',
-        'sqs:ReceiveMessage',
-        'sqs:DeleteMessage',
-        'sqs:GetQueueAttributes', // Needed for CreateQueue response
-        'sqs:TagQueue', // Used in handler to tag queue
-      ],
-      // Restrict resource pattern if possible, e.g., based on naming convention
-      resources: [`arn:aws:sqs:${this.region}:${this.account}:job-response-*`],
+    // <<< START: Add Metrics Route >>>
+    httpApi.addRoutes({
+        path: '/metrics',
+        methods: [ apigw_http.HttpMethod.GET ],
+        integration: new HttpLambdaIntegration('MetricsIntegration', metricsHandler),
     });
-    jobIngestionHandler.addToRolePolicy(sqsJobIngestionPermissionStatement);
-    // Grant permission to send to orchestrator queue
-    orchestratorInputQueue.grantSendMessages(jobIngestionHandler);
-    // Grant permission to publish CloudWatch metrics
-    jobIngestionHandler.addToRolePolicy(new iam.PolicyStatement({
-        effect: iam.Effect.ALLOW,
-        actions: ['cloudwatch:PutMetricData'],
-        // It's recommended to scope this down if possible, but '*' is common for PutMetricData
-        // Condition: { StringEquals: { "cloudwatch:namespace": "YourAppNamespace" } } // Optional: Restrict namespace
-        resources: ['*'],
-    }));
+    // <<< END: Add Metrics Route >>>
 
-    // Define Orchestrator Dispatcher Lambda
-    const orchestratorDispatcherHandler = new lambda_nodejs.NodejsFunction(this, 'OrchestratorDispatcherHandler', {
-        entry: path.join(__dirname, '../lambda/handlers/orchestrator-dispatcher.ts'),
-        handler: 'handler',
-        runtime: lambda.Runtime.NODEJS_LATEST,
-        role: webSocketHandlerRole, // Reuse role for base permissions
-        environment: {
-            AGENT_REGISTRY_TABLE_NAME: agentRegistryTable.tableName,
-            SYNC_JOB_MAPPING_TABLE_NAME: syncJobMappingTable.tableName,
-            WEBSOCKET_API_ENDPOINT: stage.url, // Pass WebSocket URL
-        },
-        timeout: cdk.Duration.seconds(30), // Allow reasonable time for processing + API calls
-    });
-    new logs.LogGroup(this, 'OrchestratorDispatcherLogGroup', {
-        logGroupName: `/aws/lambda/${orchestratorDispatcherHandler.functionName}`,
-        retention: logs.RetentionDays.ONE_WEEK,
-        removalPolicy: cdk.RemovalPolicy.DESTROY,
-    });
-
-    // Add SQS event source trigger
-    orchestratorDispatcherHandler.addEventSource(new SqsEventSource(orchestratorInputQueue, {
-        batchSize: 5, // Process up to 5 messages per invocation
-        // reportBatchItemFailures: true, // Enable partial batch failure reporting if needed
-    }));
-
-    // Grant OrchestratorDispatcher specific permissions
-    agentRegistryTable.grantReadWriteData(orchestratorDispatcherHandler); // Find agent, mark busy
-    syncJobMappingTable.grantReadWriteData(orchestratorDispatcherHandler); // Store sync mapping
-    // Permissions to post to WebSocket connections are already in webSocketHandlerRole
-
-    // --- Health Check Lambda ---
-    const healthCheckHandler = new lambda_nodejs.NodejsFunction(this, 'HealthCheckHandler', {
-        entry: path.join(__dirname, '../lambda/handlers/health-check.ts'),
-        handler: 'handler',
-        runtime: lambda.Runtime.NODEJS_LATEST,
-        environment: {
-            AGENT_REGISTRY_TABLE_NAME: agentRegistryTable.tableName,
-            SYNC_JOB_MAPPING_TABLE_NAME: syncJobMappingTable.tableName,
-        },
-        // Consider a separate, more restricted role for health checks
-        role: new iam.Role(this, 'HealthCheckHandlerRole', {
-            assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
-            managedPolicies: [
-                iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole'),
-            ],
-        }),
-    });
-    new logs.LogGroup(this, 'HealthCheckHandlerLogGroup', {
-      logGroupName: `/aws/lambda/${healthCheckHandler.functionName}`,
-      retention: logs.RetentionDays.ONE_WEEK,
-      removalPolicy: cdk.RemovalPolicy.DESTROY,
-    });
-    // Grant permission to describe tables
-    agentRegistryTable.grant(healthCheckHandler, 'dynamodb:DescribeTable');
-    syncJobMappingTable.grant(healthCheckHandler, 'dynamodb:DescribeTable');
-
-    // --- Grant Table Access to Handlers ---
+    // --- Grant Secrets Manager Read Permissions ---
     agentApiKeysSecret.grantRead(connectHandler);
-    agentRegistryTable.grantReadWriteData(connectHandler);
+    // Ensure disconnect and default handlers also have necessary permissions if they interact with registry
     agentRegistryTable.grantReadWriteData(disconnectHandler);
     agentRegistryTable.grantReadWriteData(defaultHandler);
-    syncJobMappingTable.grantReadData(defaultHandler); // Default handler needs to read sync map
-    // jobRepositoryTable.grantReadWriteData(jobIngestionHandler); // Grant when table is enabled
+    agentRegistryTable.grantReadWriteData(orchestratorDispatcherHandler);
+    // Grant sync table permissions
+    syncJobMappingTable.grantReadWriteData(defaultHandler);
+    syncJobMappingTable.grantReadWriteData(orchestratorDispatcherHandler); // Dispatcher needs to write mapping
+    syncJobMappingTable.grantReadWriteData(jobIngestionHandler); // Job ingestion needs to write mapping
 
-    // --- HTTP API Gateway Integrations ---
-    // Job Ingestion Route
-    httpApi.addRoutes({
-        path: '/jobs',
-        methods: [apigw_http.HttpMethod.POST],
-        integration: new HttpLambdaIntegration('JobIngestionIntegration', jobIngestionHandler),
+    // Grant permission for dispatcher to post back to WebSocket connections
+    const webSocketPolicy = new iam.PolicyStatement({
+        actions: ['execute-api:ManageConnections'],
+        resources: [
+            `arn:aws:execute-api:${this.region}:${this.account}:${webSocketApi.apiId}/${stage.stageName}/POST/@connections/*`
+        ],
+        effect: iam.Effect.ALLOW,
     });
+    orchestratorDispatcherHandler.addToRolePolicy(webSocketPolicy);
+    defaultHandler.addToRolePolicy(webSocketPolicy); // Default handler might also need to send messages
 
-    // Health Check Route
-    httpApi.addRoutes({
-        path: '/health',
-        methods: [apigw_http.HttpMethod.GET],
-        integration: new HttpLambdaIntegration('HealthCheckIntegration', healthCheckHandler),
-    });
+    // Grant CloudWatch PutMetricData permissions (if using custom metrics pushed from Lambda)
+    lambdaHandlerRole.addToPolicy(new iam.PolicyStatement({
+        actions: ['cloudwatch:PutMetricData'],
+        resources: ['*'], // Can optionally restrict namespace
+    }));
 
     // --- Outputs ---
-    new cdk.CfnOutput(this, 'WebSocketApiEndpoint', {
-        value: stage.url,
-        description: 'The endpoint URL for the WebSocket API',
+    new cdk.CfnOutput(this, 'WebSocketApiUrl', {
+      value: stage.url,
+      description: 'The URL of the WebSocket API',
+    });
+    new cdk.CfnOutput(this, 'HttpApiUrl', {
+      value: httpApi.url!,
+      description: 'The URL of the HTTP API Gateway for job ingestion',
+    });
+     new cdk.CfnOutput(this, 'OrchestratorInputQueueUrl', {
+      value: orchestratorInputQueue.queueUrl,
+      description: 'URL of the Orchestrator Input SQS Queue',
+    });
+    new cdk.CfnOutput(this, 'OrchestratorInputQueueArn', {
+      value: orchestratorInputQueue.queueArn,
+      description: 'ARN of the Orchestrator Input SQS Queue',
     });
 
-    new cdk.CfnOutput(this, 'WebSocketApiId', {
-      value: webSocketApi.apiId,
-      description: 'The ID of the WebSocket API',
-    });
-
-    new cdk.CfnOutput(this, 'HttpApiEndpoint', {
-        value: httpApi.url ? httpApi.url : 'Deployment error: No URL',
-        description: 'The endpoint URL for the HTTP API',
-    });
-
-    new cdk.CfnOutput(this, 'AgentApiKeysSecretName', {
-        value: agentApiKeysSecret.secretName,
-        description: 'Name of the Secrets Manager secret storing agent API keys',
-    });
-
-    new cdk.CfnOutput(this, 'AgentRegistryTableName', {
-        value: agentRegistryTable.tableName,
-        description: 'Name of the DynamoDB table for agent registry',
-    });
-
-    new cdk.CfnOutput(this, 'SyncJobMappingTableName', {
-        value: syncJobMappingTable.tableName,
-        description: 'Name of the DynamoDB table for sync job mapping',
-    });
   }
 }

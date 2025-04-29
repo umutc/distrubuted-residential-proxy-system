@@ -5,6 +5,12 @@ import { marshall } from '@aws-sdk/util-dynamodb';
 import { findAvailableAgent, markAgentAsBusy, deleteAgentConnection } from '../utils/agent-registry'; // Import correct utils
 import { JobData } from '../utils/types';
 import logger from '../utils/logger'; // Import the shared logger
+import {
+    jobsDistributedCounter,
+    jobDistributionErrorsCounter,
+    availableAgentsGauge,
+    busyAgentsGauge
+} from '../utils/metrics';
 
 const AGENT_REGISTRY_TABLE_NAME = process.env.AGENT_REGISTRY_TABLE_NAME;
 const SYNC_JOB_MAPPING_TABLE_NAME = process.env.SYNC_JOB_MAPPING_TABLE_NAME;
@@ -32,6 +38,9 @@ export const handler: SQSHandler = async (event: SQSEvent) => {
         const approximateReceiveCount = parseInt(record.attributes.ApproximateReceiveCount || '1', 10);
         const log = logger.child({ sqsMessageId: messageId, approximateReceiveCount }); // Base logger for this message
         let jobId = 'unknown'; // Default jobId for logging if parsing fails
+        let correlationId: string | undefined;
+        let responseQueueUrl: string | undefined;
+        let markedBusy = false; // Track if we successfully marked agent busy
         try {
             log.info(`Processing SQS message (Attempt ${approximateReceiveCount})`);
             let jobData: JobData & { correlationId?: string; responseQueueUrl?: string };
@@ -47,13 +56,14 @@ export const handler: SQSHandler = async (event: SQSEvent) => {
             jobId = jobData.jobId || 'unknown';
             const jobLog = log.child({ jobId }); // Specific logger with jobId
 
-            const { correlationId, responseQueueUrl, timeoutMs, ...agentJobPayload } = jobData;
+            correlationId = jobData.correlationId;
+            responseQueueUrl = jobData.responseQueueUrl;
 
             jobLog.info({ isSync: !!correlationId }, `Processing job`);
 
             // 1. Store sync mapping info if present
             if (correlationId && responseQueueUrl) {
-                const ttl = Math.floor(Date.now() / 1000) + Math.ceil((timeoutMs || 30000) / 1000) + JOB_TTL_BUFFER_SECONDS;
+                const ttl = Math.floor(Date.now() / 1000) + Math.ceil((jobData.timeoutMs || 30000) / 1000) + JOB_TTL_BUFFER_SECONDS;
                 jobLog.info({ ttl, correlationId, responseQueueUrl, syncMapTable: SYNC_JOB_MAPPING_TABLE_NAME }, `Storing sync mapping info`);
                 try {
                   await dynamoDb.send(new PutItemCommand({
@@ -82,6 +92,7 @@ export const handler: SQSHandler = async (event: SQSEvent) => {
                 // Throw error to let SQS handle retry/DLQ
                 const errorCode = 'ORC-JOB-1001';
                 jobLog.error({ errorCode }, `No available agents found.`);
+                jobDistributionErrorsCounter.labels({ reason: 'no_agent_available' }).inc();
                 if (approximateReceiveCount >= MAX_RETRY_ATTEMPTS) {
                      jobLog.warn({ errorCode }, `Max retry attempts (${MAX_RETRY_ATTEMPTS}) reached for finding agent. Sending to DLQ.`);
                      throw new Error(`[Retryable Error] No available agents found for job ${jobId} after ${approximateReceiveCount} attempts.`); 
@@ -97,7 +108,7 @@ export const handler: SQSHandler = async (event: SQSEvent) => {
 
             // 3. Mark agent busy
             jobLog.info({ agentId: agent.agentId, connectionId: agent.connectionId }, `Marking agent as busy`);
-            const markedBusy = await markAgentAsBusy(agent.connectionId, jobId);
+            markedBusy = await markAgentAsBusy(agent.connectionId, jobId);
             if (!markedBusy) {
                 // Throw error to let SQS handle retry/DLQ (likely condition check failed)
                 const errorCode = 'ORC-JOB-1002';
@@ -111,14 +122,17 @@ export const handler: SQSHandler = async (event: SQSEvent) => {
                      return; // Stop processing this record, let SQS handle retry
                 }
             }
+            jobLog.info({ agentId: agent.agentId, connectionId: agent.connectionId }, `Agent marked as busy and metrics updated`);
+            availableAgentsGauge.dec();
+            busyAgentsGauge.inc();
 
             // 4. Send job to agent via WebSocket
             const payloadToSend = {
                 action: 'execute_job', 
                 data: {
-                    ...agentJobPayload,
+                    ...jobData,
                     jobId: jobId, 
-                    timeoutMs: timeoutMs || 30000,
+                    timeoutMs: jobData.timeoutMs || 30000,
                 },
             };
             jobLog.info({ agentId: agent.agentId, connectionId: agent.connectionId }, `Sending job to agent`);
@@ -127,6 +141,7 @@ export const handler: SQSHandler = async (event: SQSEvent) => {
                     ConnectionId: agent.connectionId,
                     Data: Buffer.from(JSON.stringify(payloadToSend)),
                 }));
+                jobsDistributedCounter.inc();
                 jobLog.info({ agentId: agent.agentId }, `Successfully sent job to agent`);
             } catch (error: any) {
                  let errorCode = 'ORC-DEP-1010'; // Default WebSocket send error
@@ -158,12 +173,34 @@ export const handler: SQSHandler = async (event: SQSEvent) => {
             }
 
         } catch (error: any) {
-            // Use the logger with jobId if available, otherwise the base message logger
-            // Use a generic orchestrator processing error code
-            (jobId !== 'unknown' ? logger.child({ jobId }) : log).error({ errorCode: 'ORC-UNK-1000', error: error.message, stack: error.stack }, `Failed to process SQS message`);
-            // Throw error to ensure message goes back to queue or DLQ if configured
-            // This catch block handles non-retryable errors or errors after max retries
-            throw error;
+            const errorCode = 'ORC-DSP-1000'; // General dispatcher error
+            // Use the main log instance, adding jobId if available
+            const errorLog = jobId ? log.child({ jobId }) : log;
+            errorLog.error({ errorCode, error: error.message, stack: error.stack, body: record.body }, 'Unhandled error processing SQS record');
+            jobDistributionErrorsCounter.labels({ reason: 'unhandled_exception' }).inc();
+
+            // Check if an agent was potentially marked busy before this error occurred
+            // Relies on connectionId and agentId being defined earlier if agent selection succeeded
+            if (markedBusy && agent && agent.connectionId) { 
+                 log.warn({ agentId: agent.agentId, connectionId: agent.connectionId }, 'Attempting to revert agent status due to unhandled exception.');
+                 try {
+                    // Ensure markAgentAvailable exists and handles potential errors
+                    await markAgentAsBusy(agent.connectionId, null);
+                    availableAgentsGauge.inc(); // Revert metric
+                    busyAgentsGauge.dec();    // Revert metric
+                    log.info({ agentId: agent.agentId, connectionId: agent.connectionId }, 'Agent status reverted to available after exception.');
+                 } catch (revertError: any) {
+                    // Log critical failure to revert status
+                    log.fatal({ errorCode: 'ORC-DSP-1003', agentId: agent.agentId, connectionId: agent.connectionId, error: revertError.message, stack: revertError.stack }, 'CRITICAL: Failed to revert agent status after unhandled exception!');
+                    // Consider additional alerting here
+                 }
+            } else {
+                 // Log if no revert was needed or possible
+                 log.debug({ markedBusy, connectionIdExists: !!agent?.connectionId }, 'No agent status to revert or agent was not marked busy.');
+            }
+            
+            // Let SQS handle retries/DLQ based on Lambda configuration
+            throw error; // Re-throw the original error to signal failure to SQS
         }
     });
 

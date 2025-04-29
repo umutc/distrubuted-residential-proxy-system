@@ -10,14 +10,24 @@ import { marshall, unmarshall } from '@aws-sdk/util-dynamodb'; // Import marshal
 import { v4 as uuidv4 } from 'uuid';
 import { AgentInfo } from '../utils/types';
 import logger from '../utils/logger'; // Import the shared logger
+// import { createMetric } from '../utils/metrics-cloudwatch'; // Assuming a CloudWatch metric utility
+import {
+    jobResponseHandlingErrorsCounter,
+    jobsCompletedCounter, // Assuming job completion status is updated here or nearby
+    availableAgentsGauge, // Need to update agent status
+    busyAgentsGauge // Need to update agent status
+} from '../utils/metrics'; // Import Prometheus metrics
+import { DynamoDBDocumentClient, UpdateCommand, UpdateCommandInput } from "@aws-sdk/lib-dynamodb";
+// import { sendToSqs } from "../utils/sqsHelper"; // Assuming SQS helper function
 
 // Initialize clients outside the handler for potential reuse
-const dynamoDb = new DynamoDBClient({});
-const sqsClient = new SQSClient({}); 
+const dynamoDBClient = new DynamoDBClient({});
+const docClient = DynamoDBDocumentClient.from(dynamoDBClient); // Initialize docClient
+const sqsClient = new SQSClient({});
 
 const TABLE_NAME = process.env.AGENT_REGISTRY_TABLE_NAME;
 const SYNC_JOB_MAPPING_TABLE_NAME = process.env.SYNC_JOB_MAPPING_TABLE_NAME;
-// const DEAD_LETTER_QUEUE_URL = process.env.DEAD_LETTER_QUEUE_URL;
+const JOB_STATUS_TABLE_NAME = process.env.JOB_STATUS_TABLE_NAME; // Assuming a table to track job status
 
 // Note: Instantiating the client outside the handler for potential reuse
 const apiGwManagementApi = new ApiGatewayManagementApi({
@@ -27,6 +37,13 @@ const apiGwManagementApi = new ApiGatewayManagementApi({
 
 // Keep client instantiation outside handler
 // const managementApi = new ApiGatewayManagementApi({}); // Replaced by api instance below
+
+// Ensure docClient is initialized if not already global
+// const dynamoDBClient = new DynamoDBClient({});
+// const docClient = DynamoDBDocumentClient.from(dynamoDBClient);
+
+// Ensure AGENT_REGISTRY_TABLE_NAME is defined
+// const AGENT_REGISTRY_TABLE_NAME = process.env.AGENT_REGISTRY_TABLE_NAME;
 
 export const handler = async (event: APIGatewayProxyWebsocketEventV2): Promise<APIGatewayProxyResultV2> => {
   const connectionId = event.requestContext.connectionId;
@@ -88,7 +105,7 @@ export const handler = async (event: APIGatewayProxyWebsocketEventV2): Promise<A
         }
         // Store agent info and set status to available
         try {
-          await dynamoDb.send(new UpdateItemCommand({
+          await dynamoDBClient.send(new UpdateItemCommand({
             TableName: TABLE_NAME,
             Key: { connectionId: { S: connectionId } },
             UpdateExpression: 'SET agentId = :agentId, capabilities = :capabilities, metadata = :metadata, #status = :status, updatedAt = :updatedAt',
@@ -152,7 +169,7 @@ export const handler = async (event: APIGatewayProxyWebsocketEventV2): Promise<A
             break; // Exit case
         }
 
-        const { jobId, status, result, error: jobError } = body.data; // Rename error to avoid conflict
+        const { jobId, status, result, error: jobError, correlationId, responseQueueUrl } = body.data; // Rename error to avoid conflict
         const jobLog = log.child({ jobId }); // Add jobId to logs for this case
 
         // Use a finally block to ensure agent is marked available
@@ -190,7 +207,7 @@ export const handler = async (event: APIGatewayProxyWebsocketEventV2): Promise<A
                       TableName: SYNC_JOB_MAPPING_TABLE_NAME,
                       Key: marshall({ jobId: jobId }),
                     });
-                    const syncInfoResult = await dynamoDb.send(getItemCommand);
+                    const syncInfoResult = await dynamoDBClient.send(getItemCommand);
 
                     if (syncInfoResult.Item) {
                       const syncInfo = unmarshall(syncInfoResult.Item);
@@ -218,7 +235,7 @@ export const handler = async (event: APIGatewayProxyWebsocketEventV2): Promise<A
                         syncLog.info(`Successfully sent response to queue`);
 
                         // Delete the mapping entry from DynamoDB
-                        await dynamoDb.send(new DeleteItemCommand({
+                        await dynamoDBClient.send(new DeleteItemCommand({
                           TableName: SYNC_JOB_MAPPING_TABLE_NAME,
                           Key: marshall({ jobId: jobId }),
                         }));
@@ -256,6 +273,42 @@ export const handler = async (event: APIGatewayProxyWebsocketEventV2): Promise<A
                    // Log if acknowledgement fails, but don't block marking agent available
                    jobLog.warn({ errorCode: 'ORC-DEP-1010', error: ackError.message }, 'Failed to send job_response_received ack to agent.');
                 }
+
+                // 1. Update Job Status (if applicable)
+                jobsCompletedCounter.labels(status === 'success' ? 'success' : 'failed').inc();
+                log.debug({ jobId, status }, 'Job status updated (metrics incremented)');
+
+                // 2. Update Agent Status to 'available' in registry
+                // Use DynamoDBDocumentClient for easier updates
+                const updateAgentParams: UpdateCommandInput = {
+                    TableName: TABLE_NAME!,
+                    Key: { connectionId },
+                    UpdateExpression: 'SET #s = :status, currentJobId = :jobId, updatedAt = :ts',
+                    ExpressionAttributeNames: { '#s': 'status' },
+                    ExpressionAttributeValues: {
+                        ':status': 'available',
+                        ':jobId': null,
+                        ':ts': new Date().toISOString()
+                    },
+                    ReturnValues: "UPDATED_OLD" // Use SDK enum string value
+                };
+                const oldAgentData = await docClient.send(new UpdateCommand(updateAgentParams));
+                const previousStatus = oldAgentData.Attributes?.status;
+
+                availableAgentsGauge.inc(); // Agent is now available
+                if (previousStatus === 'busy') {
+                    busyAgentsGauge.dec(); // Decrement busy only if it *was* busy
+                }
+                log.debug({ connectionId, previousStatus }, 'Agent status set to available, metrics updated.');
+
+                // 3. Notify waiting synchronous request (if applicable)
+                if (correlationId && responseQueueUrl) {
+                    jobLog.debug({ correlationId, queueUrl: responseQueueUrl }, 'Sending response to sync queue');
+                    // await sendToSqs(responseQueueUrl, body.data, correlationId, jobLog); // Commented out: Placeholder - Implement later
+                }
+
+                // createMetric('JobResponse', 1, [...]); // Existing CloudWatch metric call
+                return { statusCode, body: 'Message processed' }; // Return potentially updated status code
             }
         } finally {
             // --- Mark agent as available (Crucial step in finally block) ---

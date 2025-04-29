@@ -2,6 +2,7 @@ import { DynamoDBClient, PutItemCommand } from '@aws-sdk/client-dynamodb';
 import { APIGatewayProxyWebsocketEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 import { AgentInfo } from '../utils/types';
 import logger from '../utils/logger'; // Import the shared logger
+import { connectedAgentsGauge } from '../utils/metrics'; // Import metrics
 
 const dynamoDBClient = new DynamoDBClient({});
 const tableName = process.env.AGENT_REGISTRY_TABLE_NAME;
@@ -32,6 +33,7 @@ export const handler = async (event: APIGatewayProxyWebsocketEventV2): Promise<A
     try {
         await dynamoDBClient.send(new PutItemCommand(putParams));
         log.info('Successfully stored connection ID in Agent Registry');
+        connectedAgentsGauge.inc(); // Increment connected agents gauge
         return { statusCode: 200, body: 'Connected.' };
     } catch (error: any) {
         // Use specific error code for DynamoDB failure

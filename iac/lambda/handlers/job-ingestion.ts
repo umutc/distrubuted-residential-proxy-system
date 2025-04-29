@@ -5,6 +5,11 @@ import { dispatchJob } from '../utils/job-dispatcher';
 import { SQSClient, CreateQueueCommand, DeleteQueueCommand, ReceiveMessageCommand, DeleteMessageCommand, GetQueueAttributesCommand, SendMessageCommand } from '@aws-sdk/client-sqs';
 import logger from '../utils/logger'; // Import the shared logger
 import { CloudWatchClient, PutMetricDataCommand, MetricDatum } from '@aws-sdk/client-cloudwatch';
+import {
+    jobsReceivedCounter,
+    apiRequestsCounter,
+    apiRequestDurationHistogram
+} from '../utils/metrics'; // Import metrics
 // import { DynamoDBClient } from '@aws-sdk/client-dynamodb'; // For Job Repository
 
 // const jobRepositoryTableName = process.env.JOB_REPOSITORY_TABLE_NAME;
