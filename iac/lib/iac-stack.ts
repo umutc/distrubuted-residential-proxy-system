@@ -239,6 +239,23 @@ export class OrchestratorStack extends cdk.Stack {
     });
     // <<< END: Add Agent Monitoring Handler >>>
 
+    // <<< START: Add Heartbeat Handler >>>
+    const heartbeatHandler = new lambda_nodejs.NodejsFunction(this, 'HeartbeatHandler', {
+      entry: path.join(__dirname, '../lambda/handlers/heartbeat.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_LATEST,
+      role: lambdaHandlerRole, // Reuse shared role (needs DynamoDB write)
+      environment: lambdaEnvironment, 
+    });
+    // Grant write access to the Agent Registry table (UpdateItem)
+    agentRegistryTable.grantReadWriteData(heartbeatHandler);
+    new logs.LogGroup(this, 'HeartbeatHandlerLogGroup', {
+      logGroupName: `/aws/lambda/${heartbeatHandler.functionName}`,
+      retention: logs.RetentionDays.ONE_WEEK,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+    // <<< END: Add Heartbeat Handler >>>
+
     // --- WebSocket API Gateway ---
     const webSocketApi = new apigwv2.WebSocketApi(this, 'ResidentialProxyWebSocketApi', {
       apiName: 'ResidentialProxyWebSocketApi',
@@ -251,6 +268,12 @@ export class OrchestratorStack extends cdk.Stack {
       integration: new WebSocketLambdaIntegration('DefaultIntegration', defaultHandler),
     });
 
+    // <<< START: Add Heartbeat Route >>>
+    webSocketApi.addRoute('heartbeat', {
+        integration: new WebSocketLambdaIntegration('HeartbeatIntegration', heartbeatHandler),
+    });
+    // <<< END: Add Heartbeat Route >>>
+
     // --- Deployment Stage ---
     const stage = new WebSocketStage(this, 'DevStage', {
       webSocketApi,
@@ -262,6 +285,10 @@ export class OrchestratorStack extends cdk.Stack {
     [connectHandler, disconnectHandler, defaultHandler, jobIngestionHandler, orchestratorDispatcherHandler, metricsHandler, agentMonitoringHandler].forEach(handler => {
          handler.addEnvironment('WEBSOCKET_API_ENDPOINT', webSocketUrl);
     });
+
+    // <<< START: Add HeartbeatHandler to Environment Update >>>
+    heartbeatHandler.addEnvironment('WEBSOCKET_API_ENDPOINT', webSocketUrl);
+    // <<< END: Add HeartbeatHandler to Environment Update >>>
 
     // Access the underlying CfnStage
     const cfnStage = stage.node.defaultChild as CfnStage;
