@@ -88,6 +88,7 @@ export const handler: SQSHandler = async (event: SQSEvent) => {
                 } else {
                      jobLog.info({ errorCode }, `Attempting retry #${approximateReceiveCount} for finding agent.`);
                      // Don't throw immediately, let SQS redeliver after visibility timeout
+                     // Returning successfully allows SQS to handle the retry based on visibility timeout.
                      // We might want to adjust visibility timeout here in the future for backoff
                      return; // Stop processing this record, let SQS handle retry
                 }
@@ -106,6 +107,7 @@ export const handler: SQSHandler = async (event: SQSEvent) => {
                      throw new Error(`[Retryable Error] Failed to mark agent ${agent.agentId} as busy after ${approximateReceiveCount} attempts`); 
                 } else {
                      jobLog.info({ errorCode }, `Attempting retry #${approximateReceiveCount} for marking agent busy.`);
+                     // Returning successfully allows SQS to handle the retry based on visibility timeout.
                      return; // Stop processing this record, let SQS handle retry
                 }
             }
@@ -143,6 +145,7 @@ export const handler: SQSHandler = async (event: SQSEvent) => {
                      } else {
                          jobLog.info({ errorCode }, `Attempting retry #${approximateReceiveCount} due to GoneException.`);
                          // Don't re-throw immediately, let SQS retry. The agent registry cleanup already happened.
+                         // Returning successfully allows SQS to handle the retry based on visibility timeout.
                          return; // Stop processing this record, let SQS handle retry
                      }
                  } else {

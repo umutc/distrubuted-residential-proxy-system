@@ -123,6 +123,7 @@ export const handler = async (event: APIGatewayProxyEventV2, context: Context): 
             const lambdaTimeout = context.getRemainingTimeInMillis() - SYNC_TIMEOUT_BUFFER_MS;
             const maxWaitTime = Math.min(MAX_SYNC_WAIT_MS, lambdaTimeout, effectiveTimeoutMs + 1000); // Use job timeout + buffer, capped by lambda/overall limit
             console.log(`Request ${requestId} (Sync): Max wait time calculated: ${maxWaitTime}ms (Lambda: ${lambdaTimeout}ms, Job: ${effectiveTimeoutMs}ms)`);
+            log.info({ jobId, correlationId, queueUrl, maxWaitTimeMs: maxWaitTime }, `Starting wait loop for synchronous response.`); // Added detailed log
 
             try {
                 // 1. Create temporary response queue
@@ -163,16 +164,29 @@ export const handler = async (event: APIGatewayProxyEventV2, context: Context): 
                  console.log(`Request ${requestId} (Sync): Job ${jobId} sent to orchestrator queue.`);
 
                 // 3. Wait for response from the temporary queue
-                console.log(`Request ${requestId} (Sync): Waiting for response on ${queueUrl} (max ${maxWaitTime}ms)...`);
+                log.debug({ queueUrl, maxWaitTimeMs: maxWaitTime }, `Entering SQS receive message loop.`); // Changed console.log to log.debug
                 let responseMessage;
                 const waitStartTime = Date.now();
                 while (Date.now() - waitStartTime < maxWaitTime) {
-                    const remainingTime = maxWaitTime - (Date.now() - waitStartTime);
-                    if (remainingTime <= 0) break;
-                    const waitTimeSeconds = Math.min(SQS_WAIT_TIME_SECONDS, Math.ceil(remainingTime / 1000));
-                    if (waitTimeSeconds <= 0) break; 
+                    const loopIterationStartTime = Date.now(); // Track loop iteration start
+                    const remainingTimeOverall = maxWaitTime - (Date.now() - waitStartTime);
+                    const remainingLambdaTime = context.getRemainingTimeInMillis();
+
+                    // Calculate SQS wait time, ensuring it doesn't exceed remaining overall time or lambda time budget
+                    const sqsWaitPotential = Math.min(
+                        SQS_WAIT_TIME_SECONDS, 
+                        Math.floor(remainingTimeOverall / 1000),
+                        Math.floor((remainingLambdaTime - SYNC_TIMEOUT_BUFFER_MS) / 1000) // Check against remaining Lambda time with buffer
+                    );
                     
-                    console.log(`Request ${requestId} (Sync): Polling queue ${queueUrl} (wait: ${waitTimeSeconds}s)...`);
+                    if (sqsWaitPotential <= 0) {
+                       log.warn({ jobId, correlationId, remainingTimeOverall, remainingLambdaTime }, `Insufficient time remaining for SQS polling. Breaking wait loop.`);
+                       break; // Exit loop if not enough time to poll and cleanup
+                    }
+                    const waitTimeSeconds = sqsWaitPotential;
+                    
+                    log.debug({ jobId, correlationId, queueUrl, waitTimeSeconds, remainingTimeOverall, remainingLambdaTime }, `Polling queue...`); // Changed console.log to log.debug
+
                     const receiveMessageCommand = new ReceiveMessageCommand({
                         QueueUrl: queueUrl,
                         MaxNumberOfMessages: 1,
@@ -195,6 +209,11 @@ export const handler = async (event: APIGatewayProxyEventV2, context: Context): 
                         console.log(`Request ${requestId} (Sync): Deleted message ${responseMessage.MessageId} from queue.`);
                         break; // Exit loop on message received
                     }
+                }
+
+                // Check if loop exited due to timeout
+                if (!responseMessage) {
+                   log.warn({ jobId, correlationId, waitedMs: Date.now() - waitStartTime, maxWaitTimeMs: maxWaitTime }, `Wait loop finished without receiving a message (timeout or insufficient time).`);
                 }
 
                 // 4. Process response or handle timeout
@@ -275,6 +294,14 @@ export const handler = async (event: APIGatewayProxyEventV2, context: Context): 
                     statusCode: 500,
                     body: JSON.stringify({ message: 'Error during synchronous job processing.', error: syncError.message, jobId, requestId }),
                 };
+            } finally {
+                // Ensure queueUrl is defined before attempting deletion
+                if (queueUrl) {
+                    log.info({ jobId, correlationId, queueUrl }, `Initiating cleanup of temporary queue.`);
+                    await deleteTempQueue(queueUrl, requestId, '(sync flow completion)');
+                } else {
+                    log.warn({ jobId, correlationId }, `Cannot cleanup temporary queue as queueUrl was not defined (likely queue creation failed).`);
+                }
             }
 
         } else {

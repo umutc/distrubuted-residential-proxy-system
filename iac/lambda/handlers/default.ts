@@ -155,125 +155,114 @@ export const handler = async (event: APIGatewayProxyWebsocketEventV2): Promise<A
         const { jobId, status, result, error: jobError } = body.data; // Rename error to avoid conflict
         const jobLog = log.child({ jobId }); // Add jobId to logs for this case
 
-        if (!jobId || typeof jobId !== 'string') {
-            jobLog.warn({ receivedJobId: jobId, errorCode: 'ORC-VAL-1001' }, 'Invalid job_response: Missing or invalid jobId.');
-            await api.send(new PostToConnectionCommand({
-              ConnectionId: connectionId,
-              Data: Buffer.from(JSON.stringify({ error: 'Invalid job_response: Missing or invalid jobId', requestId: originalRequestId }))
-            }));
-            statusCode = 400;
-            break; // Exit case
-        }
-
-        if (!status || !['success', 'failure'].includes(status)) {
-            jobLog.warn({ statusReceived: status, errorCode: 'ORC-VAL-1001' }, `Invalid job_response: Missing or invalid status.`);
-            await api.send(new PostToConnectionCommand({
-              ConnectionId: connectionId,
-              Data: Buffer.from(JSON.stringify({ error: `Invalid job_response: Missing or invalid status: ${status}`, jobId: jobId, requestId: originalRequestId }))
-            }));
-            statusCode = 400;
-            break; // Exit case
-        }
-
-        // Log job response
-        jobLog.info({ status }, `Received job response`);
-        if (status === 'success' && result) {
-          jobLog.info({ targetStatusCode: result.statusCode, isBase64: result.isBase64Encoded }, `Job success result details`);
-          // TODO (Future Task): Store successful result in JobRepository/DynamoDB
-        } else if (status === 'failure' && jobError) {
-          jobLog.error({ jobErrorMessage: jobError.message, jobErrorCode: jobError.code, targetStatusCode: jobError.statusCode }, `Job failure details`);
-          // TODO (Future Task): Store error details in JobRepository/DynamoDB
-        }
-
-        // --- Notify Waiting Synchronous Handler (if applicable) --- 
-        if (SYNC_JOB_MAPPING_TABLE_NAME) {
-          try {
-            jobLog.info({ syncMapTable: SYNC_JOB_MAPPING_TABLE_NAME }, `Checking sync mapping table for sync info.`);
-            const getItemCommand = new GetItemCommand({
-              TableName: SYNC_JOB_MAPPING_TABLE_NAME,
-              Key: marshall({ jobId: jobId }),
-            });
-            const syncInfoResult = await dynamoDb.send(getItemCommand);
-
-            if (syncInfoResult.Item) {
-              const syncInfo = unmarshall(syncInfoResult.Item);
-              const { responseQueueUrl, correlationId } = syncInfo;
-              const syncLog = jobLog.child({ correlationId, responseQueueUrl });
-
-              if (responseQueueUrl && correlationId) {
-                syncLog.info(`Found sync info. Sending response to queue.`);
-                
-                // Construct response payload for the original API caller
-                const responsePayload = {
-                  jobId: jobId,
-                  status: status,
-                  statusCode: status === 'success' ? (result?.statusCode || 200) : (jobError?.statusCode || 500),
-                  headers: status === 'success' ? (result?.headers || {}) : {},
-                  payload: status === 'success' ? result?.body : undefined, // Body might be base64 encoded from agent
-                  isBase64Encoded: status === 'success' ? result?.isBase64Encoded : false,
-                  error: status === 'failure' ? (jobError?.message || 'Agent processing failed') : undefined,
-                };
-
-                // Send response to the temporary queue
-                await sqsClient.send(new SendMessageCommand({
-                  QueueUrl: responseQueueUrl,
-                  MessageBody: JSON.stringify(responsePayload),
-                  MessageGroupId: correlationId, // Use correlationId for FIFO queue
-                }));
-                syncLog.info(`Successfully sent response to queue`);
-
-                // Delete the mapping entry from DynamoDB
-                await dynamoDb.send(new DeleteItemCommand({
-                  TableName: SYNC_JOB_MAPPING_TABLE_NAME,
-                  Key: marshall({ jobId: jobId }),
-                }));
-                syncLog.info({ syncMapTable: SYNC_JOB_MAPPING_TABLE_NAME }, `Deleted sync mapping info from table`);
-
-              } else {
-                 syncLog.warn({ syncInfoReceived: syncInfo, errorCode: 'ORC-JOB-1000' /* General job processing issue */ }, `Sync info found but missing responseQueueUrl or correlationId.`);
-              }
-            } else {
-               jobLog.info(`No sync info found. Assuming async job or timed out.`);
-            }
-          } catch (syncNotifyError: any) {
-             // Map specific AWS SDK errors if possible, otherwise use generic codes
-             let errorCode = 'ORC-DEP-1000'; // Generic dependency error
-             if (syncNotifyError.name === 'ResourceNotFoundException') {
-                  errorCode = 'ORC-DEP-1009'; // Specific for DynamoDB get/delete item fail
-             } else if (syncNotifyError.name === 'QueueDoesNotExist') {
-                  errorCode = 'ORC-DEP-1005'; // Specific for SQS send fail
-             } 
-             jobLog.error({ errorCode, error: syncNotifyError.message, stack: syncNotifyError.stack }, `Error during sync notification process`);
-             // Log error, but don't fail the primary job response handling for the agent
-          }
-        } else {
-           jobLog.warn({ jobId }, `SYNC_JOB_MAPPING_TABLE_NAME not set. Skipping sync notification check.`);
-        }
-
-        // --- Mark Agent as Available --- 
+        // Use a finally block to ensure agent is marked available
         try {
-          const markedAvailable = await markAgentAsAvailable(connectionId);
-          if (!markedAvailable) {
-            // Log the error, but proceed with acknowledgement - don't block response path
-            jobLog.error({ errorCode: 'ORC-DEP-1002' /* Failed Update */ }, `Failed to mark agent as available after job completion.`);
-            // Consider adding a metric here
-          }
-        } catch (markAvailableError: any) {
-           jobLog.error({ errorCode: 'ORC-DEP-1002', error: markAvailableError.message, stack: markAvailableError.stack }, `Error marking agent as available.`);
-           // Proceed with ack anyway
-        }
+            if (!jobId || typeof jobId !== 'string') {
+                jobLog.warn({ receivedJobId: jobId, errorCode: 'ORC-VAL-1001' }, 'Invalid job_response: Missing or invalid jobId.');
+                await api.send(new PostToConnectionCommand({
+                  ConnectionId: connectionId,
+                  Data: Buffer.from(JSON.stringify({ error: 'Invalid job_response: Missing or invalid jobId', requestId: originalRequestId }))
+                }));
+                statusCode = 400;
+            } else if (!status || !['success', 'failure'].includes(status)) {
+                jobLog.warn({ statusReceived: status, errorCode: 'ORC-VAL-1001' }, `Invalid job_response: Missing or invalid status.`);
+                await api.send(new PostToConnectionCommand({
+                  ConnectionId: connectionId,
+                  Data: Buffer.from(JSON.stringify({ error: `Invalid job_response: Missing or invalid status: ${status}`, jobId: jobId, requestId: originalRequestId }))
+                }));
+                statusCode = 400;
+            } else {
+                // Log job response
+                jobLog.info({ status }, `Received job response`);
+                if (status === 'success' && result) {
+                  jobLog.info({ targetStatusCode: result.statusCode, isBase64: result.isBase64Encoded }, `Job success result details`);
+                  // TODO (Future Task): Store successful result in JobRepository/DynamoDB
+                } else if (status === 'failure' && jobError) {
+                  jobLog.error({ jobErrorMessage: jobError.message, jobErrorCode: jobError.code, targetStatusCode: jobError.statusCode }, `Job failure details`);
+                  // TODO (Future Task): Store error details in JobRepository/DynamoDB
+                }
 
-        // --- Send Acknowledgement --- 
-        await api.send(new PostToConnectionCommand({
-          ConnectionId: connectionId,
-          Data: Buffer.from(JSON.stringify({
-            action: 'job_response_received',
-            requestId: originalRequestId,
-            data: { jobId }
-          }))
-        }));
-        jobLog.info('Sent job_response_received acknowledgement to agent.');
-        // createMetric('JobResponse', 1, [ { Name: 'Status', Value: status }, { Name: 'JobId', Value: jobId } ]);
+                // --- Notify Waiting Synchronous Handler (if applicable) --- 
+                if (SYNC_JOB_MAPPING_TABLE_NAME) {
+                  try {
+                    jobLog.info({ syncMapTable: SYNC_JOB_MAPPING_TABLE_NAME }, `Checking sync mapping table for sync info.`);
+                    const getItemCommand = new GetItemCommand({
+                      TableName: SYNC_JOB_MAPPING_TABLE_NAME,
+                      Key: marshall({ jobId: jobId }),
+                    });
+                    const syncInfoResult = await dynamoDb.send(getItemCommand);
+
+                    if (syncInfoResult.Item) {
+                      const syncInfo = unmarshall(syncInfoResult.Item);
+                      const { responseQueueUrl, correlationId } = syncInfo;
+                      const syncLog = jobLog.child({ correlationId, responseQueueUrl });
+
+                      if (responseQueueUrl && correlationId) {
+                        syncLog.info(`Found sync info. Sending response to queue.`);
+                        
+                        // Construct response payload for the original API caller
+                        const responsePayload = {
+                          jobId: jobId,
+                          status: status,
+                          // Extract relevant details from result or jobError for the API response
+                          // Ensure sensitive details are not leaked if necessary
+                          payload: status === 'success' ? result : { error: jobError },
+                        };
+
+                        // Send response to the temporary queue
+                        await sqsClient.send(new SendMessageCommand({
+                          QueueUrl: responseQueueUrl,
+                          MessageBody: JSON.stringify(responsePayload),
+                          MessageGroupId: correlationId, // Use correlationId for FIFO queue
+                        }));
+                        syncLog.info(`Successfully sent response to queue`);
+
+                        // Delete the mapping entry from DynamoDB
+                        await dynamoDb.send(new DeleteItemCommand({
+                          TableName: SYNC_JOB_MAPPING_TABLE_NAME,
+                          Key: marshall({ jobId: jobId }),
+                        }));
+                        syncLog.info({ syncMapTable: SYNC_JOB_MAPPING_TABLE_NAME }, `Deleted sync mapping info from table`);
+
+                      } else {
+                         syncLog.warn({ syncInfoReceived: syncInfo, errorCode: 'ORC-JOB-1000' /* General job processing issue */ }, `Sync info found but missing responseQueueUrl or correlationId.`);
+                      }
+                    } else {
+                       jobLog.info(`No sync info found. Assuming async job or timed out.`);
+                    }
+                  } catch (syncNotifyError: any) {
+                     // Map specific AWS SDK errors if possible, otherwise use generic codes
+                     let errorCode = 'ORC-DEP-1000'; // Generic dependency error
+                     if (syncNotifyError.name === 'ResourceNotFoundException') {
+                          errorCode = 'ORC-DEP-1009'; // Specific for DynamoDB get/delete item fail
+                     } else if (syncNotifyError.name === 'QueueDoesNotExist') {
+                          errorCode = 'ORC-DEP-1005'; // Specific for SQS send fail
+                     } 
+                     jobLog.error({ errorCode, error: syncNotifyError.message, stack: syncNotifyError.stack }, `Error during sync notification process`);
+                     // Log error, but don't fail the primary job response handling for the agent
+                  }
+                } else {
+                   jobLog.warn({ jobId }, `SYNC_JOB_MAPPING_TABLE_NAME not set. Skipping sync notification check.`);
+                }
+
+                // --- Acknowledge receipt to Agent --- 
+                try {
+                  await api.send(new PostToConnectionCommand({
+                    ConnectionId: connectionId,
+                    Data: Buffer.from(JSON.stringify({ action: 'job_response_received', requestId: originalRequestId, data: { jobId } }))
+                  }));
+                  jobLog.debug('Sent job_response_received acknowledgement to agent.');
+                } catch (ackError: any) {
+                   // Log if acknowledgement fails, but don't block marking agent available
+                   jobLog.warn({ errorCode: 'ORC-DEP-1010', error: ackError.message }, 'Failed to send job_response_received ack to agent.');
+                }
+            }
+        } finally {
+            // --- Mark agent as available (Crucial step in finally block) ---
+            jobLog.info('Attempting to mark agent as available after processing job response.');
+            await markAgentAsAvailable(connectionId);
+            // Note: markAgentAsAvailable should contain its own error logging.
+        }
         break;
       }
       default: {
