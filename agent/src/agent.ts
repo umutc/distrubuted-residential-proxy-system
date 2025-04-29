@@ -639,6 +639,17 @@ process.on('unhandledRejection', (reason, promise) => {
     gracefulShutdown(1);
 });
 
+// --- Signal Handlers for Graceful Exit ---
+process.on('SIGINT', () => {
+    logger.info('Received SIGINT signal.');
+    gracefulShutdown(0);
+});
+
+process.on('SIGTERM', () => {
+    logger.info('Received SIGTERM signal.');
+    gracefulShutdown(0);
+});
+
 // --- Initial Connection ---
 connect();
 
