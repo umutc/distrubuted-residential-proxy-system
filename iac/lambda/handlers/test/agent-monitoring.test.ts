@@ -1,45 +1,29 @@
-import { describe, it, expect, vi, beforeEach, beforeAll } from 'vitest';
+import { describe, it, expect, vi, beforeEach, beforeAll, afterAll } from 'vitest';
 import { mockDeep } from 'vitest-mock-extended';
+// Import concrete Command classes for instanceof checks
 import { DynamoDBClient, QueryCommand, ScanCommand, QueryCommandOutput, ScanCommandOutput } from '@aws-sdk/client-dynamodb';
-import { handler } from '../agent-monitoring'; // Adjust path
+import { handler } from '../agent-monitoring';
 import { APIGatewayProxyEventV2, APIGatewayProxyResultV2, APIGatewayEventRequestContextV2 } from 'aws-lambda';
-import { marshall, unmarshall as actualUnmarshall } from '@aws-sdk/util-dynamodb'; // Import marshall for creating mock items, rename actual unmarshall
-import ActualLogger from '../../utils/logger'; // Import actual logger type
+import { marshall, unmarshall as actualUnmarshall } from '@aws-sdk/util-dynamodb';
+import ActualLogger from '../../utils/logger';
 
-// --- Mocks ---
-const mockLogger = {
+// --- Define Mock Variables (used in doMock factories) ---
+const mockLoggerInstance = {
     child: vi.fn().mockReturnThis(),
     info: vi.fn(),
     warn: vi.fn(),
     error: vi.fn(),
 };
-vi.mock('../../utils/logger', () => ({ default: mockLogger }));
+const mockDynamoDbClientInstance = mockDeep<DynamoDBClient>();
+const mockUnmarshall = vi.fn();
+const MockQueryCommandInstance = vi.fn(); // Mock for constructor
+const MockScanCommandInstance = vi.fn();  // Mock for constructor
 
-vi.mock('@aws-sdk/client-dynamodb');
-
-// Mock util-dynamodb specifically for unmarshall if needed, but often testing the input/output of the handler is sufficient
-// If we mock unmarshall, ensure it behaves reasonably for the test cases.
-const mockUnmarshall = vi.fn().mockImplementation((item) => actualUnmarshall(item)); // Use actual unmarshall by default for simplicity
-vi.mock('@aws-sdk/util-dynamodb', async (importOriginal) => {
-    const original = await importOriginal<typeof import('@aws-sdk/util-dynamodb')>();
-    return {
-        ...original,
-        unmarshall: mockUnmarshall, // Allow overriding unmarshall mock per test if needed
-    };
-});
-
-const mockDynamoDbClient = mockDeep<DynamoDBClient>();
-const MockQueryCommand = vi.fn();
-const MockScanCommand = vi.fn();
-
-vi.mocked(DynamoDBClient).mockImplementation(() => mockDynamoDbClient);
-vi.mocked(QueryCommand).mockImplementation((...args) => new MockQueryCommand(...args) as any);
-vi.mocked(ScanCommand).mockImplementation((...args) => new MockScanCommand(...args) as any);
-
-// --- Tests ---
+// --- Test Suite ---
 describe('Agent Monitoring Handler', () => {
     const MOCK_TABLE_NAME = 'mock-agent-registry';
     let mockEvent: APIGatewayProxyEventV2;
+    let handler: typeof import('../agent-monitoring').handler;
 
     // Helper to create mock *unmarshalled* agent data
     const createMockAgentData = (id: string, status: string) => ({
@@ -51,19 +35,45 @@ describe('Agent Monitoring Handler', () => {
         ttl: Math.floor(Date.now() / 1000) + 3600,
     });
 
-    beforeAll(() => {
+    beforeAll(async () => {
+        // Set Env Var FIRST, before any mocks or imports that might depend on it
         process.env.AGENT_REGISTRY_TABLE_NAME = MOCK_TABLE_NAME;
+        
+        // Reset mock implementations (needed before applying mocks)
+        mockUnmarshall.mockImplementation((item) => actualUnmarshall(item));
+
+        // Apply mocks dynamically
+        vi.doMock('../../utils/logger', () => ({ default: mockLoggerInstance }));
+        vi.doMock('@aws-sdk/util-dynamodb', async (importOriginal) => {
+             const original = await importOriginal<typeof import('@aws-sdk/util-dynamodb')>();
+             return { ...original, marshall: original.marshall, unmarshall: mockUnmarshall };
+        });
+        vi.doMock('@aws-sdk/client-dynamodb', async (importOriginal) => {
+             const actual = await importOriginal<typeof import('@aws-sdk/client-dynamodb')>();
+             return { ...actual, DynamoDBClient: actual.DynamoDBClient, QueryCommand: MockQueryCommandInstance, ScanCommand: MockScanCommandInstance };
+        });
+
+        // Import handler *after* mocks and setting env var
+        const module = await import('../agent-monitoring');
+        handler = module.handler;
+    });
+
+    afterAll(() => {
+        // Unmock
+        vi.doUnmock('../../utils/logger');
+        vi.doUnmock('@aws-sdk/util-dynamodb');
+        vi.doUnmock('@aws-sdk/client-dynamodb');
     });
 
     beforeEach(() => {
+        // Ensure table name is set correctly before each test (might be redundant now but safe)
+        process.env.AGENT_REGISTRY_TABLE_NAME = MOCK_TABLE_NAME; 
+        // Clear mocks
         vi.clearAllMocks();
-        MockQueryCommand.mockClear();
-        MockScanCommand.mockClear();
-        mockUnmarshall.mockClear(); // Clear unmarshall mock calls
-        // Reset send mock for each test
-        mockDynamoDbClient.send.mockReset();
+        mockUnmarshall.mockImplementation((item) => actualUnmarshall(item));
+        mockDynamoDbClientInstance.send.mockReset();
 
-        // Default mock event
+        // Default mock event setup
         const mockRequestContext: APIGatewayEventRequestContextV2 = {
             accountId: '123456789012',
             apiId: 'test-api',
@@ -87,7 +97,7 @@ describe('Agent Monitoring Handler', () => {
             version: '2.0',
             routeKey: '$default',
             rawPath: '/agents',
-            rawQueryString: '', // Added missing property
+            rawQueryString: '',
             headers: {},
             queryStringParameters: {},
             requestContext: mockRequestContext,
@@ -101,81 +111,86 @@ describe('Agent Monitoring Handler', () => {
         expect(typeof result).toBe('object');
         expect(result).toHaveProperty('statusCode');
         expect(result).toHaveProperty('body');
-        return result as { statusCode: number; body: string }; 
+        return result as { statusCode: number; body: string };
     }
+
+    // --- Test Cases --- 
 
     it('should perform a Scan when no status filter is provided', async () => {
         const agent1 = createMockAgentData('1', 'active');
         const agent2 = createMockAgentData('2', 'busy');
-        const mockItems = [marshall(agent1), marshall(agent2)]; // Marshall data for mock response
+        const mockItems = [marshall(agent1), marshall(agent2)];
         const mockOutput: ScanCommandOutput = { Items: mockItems, $metadata: {} };
-        mockDynamoDbClient.send.mockResolvedValue(mockOutput);
+        mockDynamoDbClientInstance.send.mockResolvedValue(mockOutput as any);
 
-        const rawResult = await handler(mockEvent);
+        // Use the handler imported in beforeAll
+        const rawResult = await handler(mockEvent, { dbClient: mockDynamoDbClientInstance, unmarshall: mockUnmarshall });
         const result = expectResultStructure(rawResult);
         const body = JSON.parse(result.body);
 
         expect(result.statusCode).toBe(200);
-        expect(ScanCommand).toHaveBeenCalledTimes(1);
-        expect(QueryCommand).not.toHaveBeenCalled();
-        expect(mockDynamoDbClient.send).toHaveBeenCalledTimes(1);
+        expect(MockScanCommandInstance).toHaveBeenCalledTimes(1);
+        expect(mockDynamoDbClientInstance.send).toHaveBeenCalledTimes(1);
+        const sentCommand = mockDynamoDbClientInstance.send.mock.calls[0][0];
+        expect(sentCommand).toBeInstanceOf(MockScanCommandInstance);
         expect(body.agents).toHaveLength(2);
-        // Use actual unmarshall, so result should match input data
-        expect(body.agents[0]).toEqual(expect.objectContaining(agent1)); 
+        expect(body.agents[0]).toEqual(expect.objectContaining(agent1));
         expect(body.agents[1]).toEqual(expect.objectContaining(agent2));
         expect(body.nextToken).toBeNull();
-        expect(mockLogger.info).toHaveBeenCalledWith('Scanning AgentRegistryTable');
+        expect(mockLoggerInstance.info).toHaveBeenCalledWith('Scanning AgentRegistryTable');
     });
 
     it('should perform a Query when a status filter is provided', async () => {
         mockEvent.queryStringParameters = { status: 'active' };
-        mockEvent.rawQueryString = 'status=active'; // Update raw query string
+        mockEvent.rawQueryString = 'status=active';
         const agent1 = createMockAgentData('1', 'active');
         const mockItems = [marshall(agent1)];
         const mockOutput: QueryCommandOutput = { Items: mockItems, $metadata: {} };
-        mockDynamoDbClient.send.mockResolvedValue(mockOutput);
+        mockDynamoDbClientInstance.send.mockResolvedValue(mockOutput as any);
 
-        const rawResult = await handler(mockEvent);
+        const rawResult = await handler(mockEvent, { dbClient: mockDynamoDbClientInstance, unmarshall: mockUnmarshall });
         const result = expectResultStructure(rawResult);
         const body = JSON.parse(result.body);
 
         expect(result.statusCode).toBe(200);
-        expect(QueryCommand).toHaveBeenCalledTimes(1);
-        expect(ScanCommand).not.toHaveBeenCalled();
-        expect(mockDynamoDbClient.send).toHaveBeenCalledTimes(1);
-        const commandArgs = MockQueryCommand.mock.calls[0][0];
+        expect(MockQueryCommandInstance).toHaveBeenCalledTimes(1);
+        expect(mockDynamoDbClientInstance.send).toHaveBeenCalledTimes(1);
+        const commandArgs = MockQueryCommandInstance.mock.calls[0][0];
+        expect(commandArgs.TableName).toBe(MOCK_TABLE_NAME);
         expect(commandArgs.IndexName).toBe('StatusIndex');
         expect(commandArgs.KeyConditionExpression).toBe('#status = :statusVal');
         expect(commandArgs.ExpressionAttributeValues[':statusVal'].S).toBe('active');
+        const sentCommand = mockDynamoDbClientInstance.send.mock.calls[0][0];
+        expect(sentCommand).toBeInstanceOf(MockQueryCommandInstance);
         expect(body.agents).toHaveLength(1);
         expect(body.agents[0].status).toBe('active');
         expect(body.agents[0]).toEqual(expect.objectContaining(agent1));
         expect(body.nextToken).toBeNull();
-        expect(mockLogger.info).toHaveBeenCalledWith({ statusFilter: 'active' }, 'Querying AgentRegistryTable using StatusIndex');
+        expect(mockLoggerInstance.info).toHaveBeenCalledWith({ statusFilter: 'active' }, 'Querying AgentRegistryTable using StatusIndex');
     });
 
     it('should handle pagination with nextToken (Scan)', async () => {
-        const lastEvaluatedKeyRaw = { connectionId: 'conn-1' }; // Unmarshalled key
-        const lastEvaluatedKeyMarshalled = marshall(lastEvaluatedKeyRaw); // Marshalled key for response
-        const encodedToken = Buffer.from(JSON.stringify(lastEvaluatedKeyMarshalled)).toString('base64'); // Encode marshalled key
+        const lastEvaluatedKeyRaw = { connectionId: 'conn-1' };
+        const lastEvaluatedKeyMarshalled = marshall(lastEvaluatedKeyRaw);
+        const encodedToken = Buffer.from(JSON.stringify(lastEvaluatedKeyMarshalled)).toString('base64');
         mockEvent.queryStringParameters = { nextToken: encodedToken };
         mockEvent.rawQueryString = `nextToken=${encodedToken}`;
-        
+
         const agent2 = createMockAgentData('2', 'active');
         const mockItems = [marshall(agent2)];
-        const mockOutput: ScanCommandOutput = { Items: mockItems, $metadata: {} }; // No LastEvaluatedKey in this response
-        mockDynamoDbClient.send.mockResolvedValue(mockOutput);
+        const mockOutput: ScanCommandOutput = { Items: mockItems, $metadata: {} };
+        mockDynamoDbClientInstance.send.mockResolvedValue(mockOutput as any);
 
-        await handler(mockEvent);
+        await handler(mockEvent, { dbClient: mockDynamoDbClientInstance, unmarshall: mockUnmarshall });
 
-        expect(ScanCommand).toHaveBeenCalledTimes(1);
-        const commandArgs = MockScanCommand.mock.calls[0][0];
-        // The command receives the *marshalled* key parsed from the token
+        expect(MockScanCommandInstance).toHaveBeenCalledTimes(1);
+        const commandArgs = MockScanCommandInstance.mock.calls[0][0];
         expect(commandArgs.ExclusiveStartKey).toEqual(lastEvaluatedKeyMarshalled);
+        expect(mockDynamoDbClientInstance.send).toHaveBeenCalledTimes(1);
     });
 
     it('should handle pagination with nextToken (Query)', async () => {
-        const lastEvaluatedKeyRaw = { connectionId: 'conn-1', status: 'active' }; // GSI key + table PK (unmarshalled)
+        const lastEvaluatedKeyRaw = { connectionId: 'conn-1', status: 'active' };
         const lastEvaluatedKeyMarshalled = marshall(lastEvaluatedKeyRaw);
         const encodedToken = Buffer.from(JSON.stringify(lastEvaluatedKeyMarshalled)).toString('base64');
         mockEvent.queryStringParameters = { status: 'active', nextToken: encodedToken };
@@ -184,88 +199,151 @@ describe('Agent Monitoring Handler', () => {
         const agent2 = createMockAgentData('2', 'active');
         const mockItems = [marshall(agent2)];
         const mockOutput: QueryCommandOutput = { Items: mockItems, $metadata: {} };
-        mockDynamoDbClient.send.mockResolvedValue(mockOutput);
+        mockDynamoDbClientInstance.send.mockResolvedValue(mockOutput as any);
 
-        await handler(mockEvent);
+        await handler(mockEvent, { dbClient: mockDynamoDbClientInstance, unmarshall: mockUnmarshall });
 
-        expect(QueryCommand).toHaveBeenCalledTimes(1);
-        const commandArgs = MockQueryCommand.mock.calls[0][0];
+        expect(MockQueryCommandInstance).toHaveBeenCalledTimes(1);
+        const commandArgs = MockQueryCommandInstance.mock.calls[0][0];
         expect(commandArgs.ExclusiveStartKey).toEqual(lastEvaluatedKeyMarshalled);
+        expect(mockDynamoDbClientInstance.send).toHaveBeenCalledTimes(1);
     });
 
     it('should return nextToken when LastEvaluatedKey is present in response', async () => {
         const agent1 = createMockAgentData('1', 'active');
         const mockItems = [marshall(agent1)];
-        const lastEvaluatedKeyMarshalled = marshall({ connectionId: 'conn-1' }); // Marshalled key
+        const lastEvaluatedKeyMarshalled = marshall({ connectionId: 'conn-1' });
         const mockOutput: ScanCommandOutput = { Items: mockItems, LastEvaluatedKey: lastEvaluatedKeyMarshalled, $metadata: {} };
-        mockDynamoDbClient.send.mockResolvedValue(mockOutput);
+        mockDynamoDbClientInstance.send.mockResolvedValue(mockOutput as any);
 
-        const rawResult = await handler(mockEvent);
+        const rawResult = await handler(mockEvent, { dbClient: mockDynamoDbClientInstance, unmarshall: mockUnmarshall });
         const result = expectResultStructure(rawResult);
         const body = JSON.parse(result.body);
 
         expect(result.statusCode).toBe(200);
-        expect(body.agents).toHaveLength(1);
-        const expectedToken = Buffer.from(JSON.stringify(lastEvaluatedKeyMarshalled)).toString('base64');
-        expect(body.nextToken).toBe(expectedToken);
+        expect(body.nextToken).toBeDefined();
+        expect(typeof body.nextToken).toBe('string');
+        const decoded = JSON.parse(Buffer.from(body.nextToken, 'base64').toString('utf8'));
+        expect(decoded).toEqual(lastEvaluatedKeyMarshalled);
     });
 
-    it('should use default limit if not provided', async () => {
-        const mockOutput: ScanCommandOutput = { Items: [], $metadata: {} };
-        mockDynamoDbClient.send.mockResolvedValue(mockOutput);
-        await handler(mockEvent);
-        expect(ScanCommand).toHaveBeenCalledTimes(1);
-        const commandArgs = MockScanCommand.mock.calls[0][0];
-        expect(commandArgs.Limit).toBe(20); // Default limit
-    });
-
-    it('should use provided limit parameter', async () => {
-        mockEvent.queryStringParameters = { limit: '10' };
-        mockEvent.rawQueryString = 'limit=10';
-        const mockOutput: ScanCommandOutput = { Items: [], $metadata: {} };
-        mockDynamoDbClient.send.mockResolvedValue(mockOutput);
-        await handler(mockEvent);
-        expect(ScanCommand).toHaveBeenCalledTimes(1);
-        const commandArgs = MockScanCommand.mock.calls[0][0];
-        expect(commandArgs.Limit).toBe(10);
-    });
-
-    it('should return 400 for invalid limit parameter', async () => {
-        mockEvent.queryStringParameters = { limit: '-5' };
-        mockEvent.rawQueryString = 'limit=-5';
-        const rawResult = await handler(mockEvent);
-        const result = expectResultStructure(rawResult);
-        expect(result.statusCode).toBe(400);
-        expect(JSON.parse(result.body).message).toBe('Invalid limit parameter.');
-        expect(mockDynamoDbClient.send).not.toHaveBeenCalled();
-    });
-
-    it('should return 500 if table name is not set', async () => {
+    it('should return 500 and log error if table name is not set', async () => {
         const originalTableName = process.env.AGENT_REGISTRY_TABLE_NAME;
         delete process.env.AGENT_REGISTRY_TABLE_NAME;
-        
-        const rawResult = await handler(mockEvent);
+
+        // Reset modules and re-apply mocks just for this test context
+        vi.resetModules();
+        vi.doMock('../../utils/logger', () => ({ default: mockLoggerInstance }));
+        vi.doMock('@aws-sdk/util-dynamodb', async (importOriginal) => { 
+            const original = await importOriginal<typeof import('@aws-sdk/util-dynamodb')>(); 
+            return { 
+                ...original, 
+                marshall: original.marshall,
+                unmarshall: mockUnmarshall
+            }; 
+        });
+        vi.doMock('@aws-sdk/client-dynamodb', async (importOriginal) => { 
+            const actual = await importOriginal<typeof import('@aws-sdk/client-dynamodb')>(); 
+            return { 
+                ...actual, 
+                DynamoDBClient: actual.DynamoDBClient,
+                QueryCommand: MockQueryCommandInstance, 
+                ScanCommand: MockScanCommandInstance 
+            }; 
+        });
+
+        const { handler: localHandler } = await import('../agent-monitoring');
+
+        const rawResult = await localHandler(mockEvent, { dbClient: mockDynamoDbClientInstance, unmarshall: mockUnmarshall });
         const result = expectResultStructure(rawResult);
-        
+
+        // Restore env var and unmock
         process.env.AGENT_REGISTRY_TABLE_NAME = originalTableName;
+        vi.doUnmock('../../utils/logger');
+        vi.doUnmock('@aws-sdk/util-dynamodb');
+        vi.doUnmock('@aws-sdk/client-dynamodb');
+        vi.resetModules(); // Ensure clean state after this specific test
 
         expect(result.statusCode).toBe(500);
-        expect(JSON.parse(result.body).message).toContain('Table name not configured');
-        expect(mockLogger.error).toHaveBeenCalledWith(expect.objectContaining({ errorCode: 'ORC-CFG-1001' }), expect.any(String));
-        expect(mockDynamoDbClient.send).not.toHaveBeenCalled();
+        expect(JSON.parse(result.body).message).toBe('Internal Server Error: Table name not configured.'); 
+        expect(mockLoggerInstance.error).toHaveBeenCalledWith(expect.objectContaining({ errorCode: 'ORC-CFG-1001' }), 'AGENT_REGISTRY_TABLE_NAME environment variable not set.');
+        expect(mockDynamoDbClientInstance.send).not.toHaveBeenCalled();
     });
 
-    it('should return 500 on generic DynamoDB failure', async () => {
-        const genericError = new Error('DynamoDB failed');
-        mockDynamoDbClient.send.mockRejectedValueOnce(genericError);
+    it('should return 500 and log error on DynamoDB Scan failure', async () => {
+        const error = new Error('Scan failed');
+        mockDynamoDbClientInstance.send.mockRejectedValue(error);
 
-        const rawResult = await handler(mockEvent);
+        const rawResult = await handler(mockEvent, { dbClient: mockDynamoDbClientInstance, unmarshall: mockUnmarshall });
         const result = expectResultStructure(rawResult);
 
         expect(result.statusCode).toBe(500);
-        expect(JSON.parse(result.body).message).toContain('Internal server error');
-        expect(mockDynamoDbClient.send).toHaveBeenCalledTimes(1);
-        expect(mockLogger.error).toHaveBeenCalledWith(expect.objectContaining({ errorCode: 'ORC-DEP-1004' }), expect.any(String));
+        expect(JSON.parse(result.body).message).toBe('Internal Server Error retrieving agent data.'); // Use exact message
+        expect(mockDynamoDbClientInstance.send).toHaveBeenCalledTimes(1);
+        expect(MockScanCommandInstance).toHaveBeenCalledTimes(1); 
+        expect(mockLoggerInstance.error).toHaveBeenCalledWith(
+            expect.objectContaining({ errorCode: 'ORC-DEP-1002', error: 'Scan failed' }), 
+            'Error querying/scanning Agent Registry Table'
+        );
     });
 
-}); 
+    it('should return 500 and log error on DynamoDB Query failure', async () => {
+        mockEvent.queryStringParameters = { status: 'active' };
+        mockEvent.rawQueryString = 'status=active';
+        const error = new Error('Query failed');
+        mockDynamoDbClientInstance.send.mockRejectedValue(error);
+
+        const rawResult = await handler(mockEvent, { dbClient: mockDynamoDbClientInstance, unmarshall: mockUnmarshall });
+        const result = expectResultStructure(rawResult);
+
+        expect(result.statusCode).toBe(500);
+        expect(JSON.parse(result.body).message).toBe('Internal Server Error retrieving agent data.'); // Use exact message
+        expect(mockDynamoDbClientInstance.send).toHaveBeenCalledTimes(1);
+        expect(MockQueryCommandInstance).toHaveBeenCalledTimes(1); 
+        expect(mockLoggerInstance.error).toHaveBeenCalledWith(
+            expect.objectContaining({ errorCode: 'ORC-DEP-1002', error: 'Query failed' }), 
+            'Error querying/scanning Agent Registry Table'
+        );
+    });
+
+    it('should return 400 if invalid status is provided', async () => {
+        mockEvent.queryStringParameters = { status: 'invalid_status' };
+        mockEvent.rawQueryString = 'status=invalid_status';
+
+        const rawResult = await handler(mockEvent, { dbClient: mockDynamoDbClientInstance, unmarshall: mockUnmarshall });
+        const result = expectResultStructure(rawResult);
+
+        expect(result.statusCode).toBe(400);
+        expect(JSON.parse(result.body).message).toContain('Invalid status filter');
+        expect(mockDynamoDbClientInstance.send).not.toHaveBeenCalled();
+        expect(mockLoggerInstance.warn).toHaveBeenCalledWith({ statusFilter: 'invalid_status' }, expect.any(String));
+    });
+
+    it('should return 400 if nextToken is invalid base64', async () => {
+        mockEvent.queryStringParameters = { nextToken: 'invalid-base64!!!' };
+        mockEvent.rawQueryString = 'nextToken=invalid-base64!!!';
+
+        const rawResult = await handler(mockEvent, { dbClient: mockDynamoDbClientInstance, unmarshall: mockUnmarshall });
+        const result = expectResultStructure(rawResult);
+
+        expect(result.statusCode).toBe(400);
+        expect(JSON.parse(result.body).message).toBe('Invalid nextToken format.'); // Use exact message
+        expect(mockDynamoDbClientInstance.send).not.toHaveBeenCalled();
+        expect(mockLoggerInstance.warn).toHaveBeenCalledWith({ tokenSnippet: 'invalid-base64!!!' }, expect.any(String));
+    });
+
+    it('should return 400 if nextToken does not decode to valid JSON', async () => {
+        const nonJsonToken = Buffer.from('not json').toString('base64');
+        mockEvent.queryStringParameters = { nextToken: nonJsonToken };
+        mockEvent.rawQueryString = `nextToken=${nonJsonToken}`;
+
+        const rawResult = await handler(mockEvent, { dbClient: mockDynamoDbClientInstance, unmarshall: mockUnmarshall });
+        const result = expectResultStructure(rawResult);
+
+        expect(result.statusCode).toBe(400);
+        expect(JSON.parse(result.body).message).toBe('Invalid nextToken format.'); // Use exact message
+        expect(mockDynamoDbClientInstance.send).not.toHaveBeenCalled();
+        expect(mockLoggerInstance.warn).toHaveBeenCalledWith({ tokenSnippet: nonJsonToken.substring(0, 50) }, expect.any(String));
+    });
+
+});

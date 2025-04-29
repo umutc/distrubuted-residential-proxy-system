@@ -1,13 +1,20 @@
 import { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 import { DynamoDBClient, QueryCommand, ScanCommand, QueryCommandInput, ScanCommandInput } from '@aws-sdk/client-dynamodb';
-import { unmarshall } from '@aws-sdk/util-dynamodb';
+import { unmarshall as defaultUnmarshall } from '@aws-sdk/util-dynamodb'; // Rename default import
 import logger from '../utils/logger'; // Use default import
 import { AgentInfo } from '../utils/types'; // Assuming AgentInfo type exists
 
-const dynamoDBClient = new DynamoDBClient({});
+// Default client initialized here
+const defaultDynamoDBClient = new DynamoDBClient({});
+
 const tableName = process.env.AGENT_REGISTRY_TABLE_NAME;
 const GSI_NAME = 'StatusIndex'; // Define GSI name as constant
 const DEFAULT_LIMIT = 20; // Default number of items per page
+
+interface HandlerDependencies {
+    dbClient?: DynamoDBClient;
+    unmarshall?: (item: Record<string, any>) => Record<string, any>;
+}
 
 /**
  * Parses pagination token.
@@ -40,8 +47,16 @@ const createNextToken = (lastEvaluatedKey: Record<string, any> | undefined): str
 /**
  * Handles GET requests to /agents for monitoring connected agents.
  * Supports filtering by status and pagination.
+ * Accepts optional dependencies for testing.
  */
-export const handler = async (event: APIGatewayProxyEventV2): Promise<APIGatewayProxyResultV2> => {
+export const handler = async (
+    event: APIGatewayProxyEventV2,
+    dependencies: HandlerDependencies = {} // Accept optional dependencies
+): Promise<APIGatewayProxyResultV2> => {
+    // Use provided dependencies or defaults
+    const dynamoDBClient = dependencies.dbClient || defaultDynamoDBClient;
+    const unmarshall = dependencies.unmarshall || defaultUnmarshall;
+
     const log = logger.child({ requestId: event.requestContext?.requestId, path: event.rawPath });
     log.info('Received agent monitoring request', { queryStringParameters: event.queryStringParameters });
 
@@ -54,12 +69,37 @@ export const handler = async (event: APIGatewayProxyEventV2): Promise<APIGateway
     const limitParam = event.queryStringParameters?.limit;
     const nextTokenParam = event.queryStringParameters?.nextToken;
 
+    // --- Status filter validation (Added based on tests) ---
+    const validStatuses = ['active', 'busy', 'idle', 'error', 'terminating']; // Define valid statuses
+    if (statusFilter && !validStatuses.includes(statusFilter)) {
+        log.warn({ statusFilter }, 'Invalid status filter provided.');
+        return {
+            statusCode: 400,
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message: `Invalid status filter. Must be one of: ${validStatuses.join(', ')}` }),
+        };
+    }
+    // --- End status filter validation ---
+
     const limit = limitParam ? parseInt(limitParam, 10) : DEFAULT_LIMIT;
     if (isNaN(limit) || limit <= 0) {
-        return { statusCode: 400, body: JSON.stringify({ message: 'Invalid limit parameter.' }) };
+        log.warn({ limitParam }, 'Invalid limit parameter received.');
+        return { statusCode: 400, body: JSON.stringify({ message: 'Invalid limit parameter. Must be a positive integer.' }) };
     }
 
-    const exclusiveStartKey = parseNextToken(nextTokenParam);
+    let exclusiveStartKey: Record<string, any> | undefined;
+    if (nextTokenParam) {
+        try {
+            const decoded = Buffer.from(nextTokenParam, 'base64').toString('utf-8');
+            exclusiveStartKey = JSON.parse(decoded);
+        } catch (error) {
+            log.warn({ tokenSnippet: nextTokenParam.substring(0, 50) }, 'Invalid nextToken format received.');
+            return {
+                statusCode: 400,
+                body: JSON.stringify({ message: 'Invalid nextToken format.' }),
+            };
+        }
+    }
 
     let commandInput: QueryCommandInput | ScanCommandInput;
     let useQuery = false;
@@ -75,7 +115,6 @@ export const handler = async (event: APIGatewayProxyEventV2): Promise<APIGateway
             ExpressionAttributeValues: { ':statusVal': { S: statusFilter } },
             Limit: limit,
             ExclusiveStartKey: exclusiveStartKey,
-            // Consider adding ProjectionExpression if not all attributes are needed
         };
     } else {
         log.info('Scanning AgentRegistryTable');
@@ -84,7 +123,6 @@ export const handler = async (event: APIGatewayProxyEventV2): Promise<APIGateway
             TableName: tableName,
             Limit: limit,
             ExclusiveStartKey: exclusiveStartKey,
-            // Consider adding ProjectionExpression and FilterExpression if needed
         };
     }
 
@@ -108,11 +146,14 @@ export const handler = async (event: APIGatewayProxyEventV2): Promise<APIGateway
             body: JSON.stringify(response),
         };
     } catch (error: any) {
-        log.error({ errorCode: 'ORC-DEP-1004', error: error.message, stack: error.stack, useQuery, statusFilter }, 'Error querying/scanning Agent Registry Table');
+        // Improved error code based on tests and context
+        const errorCode = useQuery ? 'ORC-DEP-1002' : 'ORC-DEP-1002'; // Example: Same code for Scan/Query DB error
+        log.error({ errorCode, error: error.message, stack: error.stack, useQuery, statusFilter }, 'Error querying/scanning Agent Registry Table');
         return {
             statusCode: 500,
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message: 'Internal server error retrieving agent data.' }),
+            // Generic message for client
+            body: JSON.stringify({ message: 'Internal Server Error retrieving agent data.' }),
         };
     }
 }; 

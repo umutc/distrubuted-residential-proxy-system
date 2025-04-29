@@ -1,12 +1,24 @@
-import { DynamoDBClient, UpdateItemCommand } from '@aws-sdk/client-dynamodb';
+import { DynamoDBClient, UpdateItemCommand, ConditionalCheckFailedException } from '@aws-sdk/client-dynamodb';
 import { APIGatewayProxyWebsocketEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 import logger from '../utils/logger'; // Import the shared logger
 
-const dynamoDBClient = new DynamoDBClient({});
+// Default client initialized here
+const defaultDynamoDBClient = new DynamoDBClient({});
+
 const tableName = process.env.AGENT_REGISTRY_TABLE_NAME;
 const HEARTBEAT_TTL_EXTENSION_SECONDS = 15 * 60; // Extend TTL by 15 minutes on heartbeat
 
-export const handler = async (event: APIGatewayProxyWebsocketEventV2): Promise<APIGatewayProxyResultV2> => {
+interface HandlerDependencies {
+    dbClient?: DynamoDBClient;
+}
+
+export const handler = async (
+    event: APIGatewayProxyWebsocketEventV2,
+    dependencies: HandlerDependencies = {}
+): Promise<APIGatewayProxyResultV2> => {
+    // Use injected client or default
+    const dynamoDBClient = dependencies.dbClient || defaultDynamoDBClient;
+
     const connectionId = event.requestContext.connectionId;
     const receivedTime = new Date();
     const log = logger.child({ connectionId, action: 'heartbeat', receivedAt: receivedTime.toISOString() });
@@ -28,24 +40,25 @@ export const handler = async (event: APIGatewayProxyWebsocketEventV2): Promise<A
         UpdateExpression: 'SET lastHeartbeat = :ts, #ttl = :ttlValue, #status = :statusValue',
         ExpressionAttributeNames: {
             '#ttl': 'ttl',
-             '#status': 'status',
+            '#status': 'status',
         },
         ExpressionAttributeValues: {
             ':ts': { S: receivedTime.toISOString() },
             ':ttlValue': { N: String(newTtl) },
-             ':statusValue': { S: 'active' } // Mark as active on heartbeat
+            ':statusValue': { S: 'active' } // Mark as active on heartbeat
         },
         ConditionExpression: 'attribute_exists(connectionId)', // Only update if the connection exists
     };
 
     try {
+        // Use the injected or default client
         await dynamoDBClient.send(new UpdateItemCommand(updateParams));
         log.info('Successfully updated agent heartbeat and TTL');
         return { statusCode: 200, body: 'Heartbeat acknowledged.' };
     } catch (error: any) {
         if (error.name === 'ConditionalCheckFailedException') {
-             log.warn({ errorCode: 'ORC-APP-1001' }, 'Heartbeat received for unknown or disconnected connectionId.');
-             // Potentially send a message back instructing the client to reconnect? For now, just acknowledge.
+            log.warn({ errorCode: 'ORC-APP-1001' }, 'Heartbeat received for unknown or disconnected connectionId.');
+            // Potentially send a message back instructing the client to reconnect? For now, just acknowledge.
         } else {
             log.error({ errorCode: 'ORC-DEP-1003', error: error.message, stack: error.stack }, 'Error updating agent heartbeat in Agent Registry');
         }
