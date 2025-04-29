@@ -30,3 +30,7 @@ tasks/
 
 # Ignore Task Master configuration with potential secrets
 .cursor/mcp.json 
+
+# Ignore CDK output files
+cdk.out/
+iac/cdk-outputs.json 

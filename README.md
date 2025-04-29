@@ -67,21 +67,23 @@ This project is managed using [Task Master](README-task-master.md) for AI-driven
 
 The system consists of two main components:
 
-1.  **Orchestrator:** A central service hosted on AWS defined by the Infrastructure as Code (IaC) in the root `/iac` directory (using AWS CDK). It likely uses API Gateway (WebSocket & HTTP) and Lambda/ECS Fargate for compute. It handles:
+1.  **Orchestrator:** A central service hosted on AWS defined by the Infrastructure as Code (IaC) in the root `/iac` directory (using AWS CDK). It uses API Gateway (WebSocket & HTTP), Lambda functions (located in `/iac/lambda`), SQS, and DynamoDB. It handles:
     -   Agent authentication and connection management via WebSocket.
     -   Receiving jobs from internal services via an HTTP API.
     -   Distributing jobs to connected Agents via WebSocket.
     -   Receiving responses from Agents.
     -   Returning responses to the originating service.
-    -   Maintaining an Agent registry (in-memory for MVP).
-    -   Providing a monitoring endpoint.
-2.  **Agent:** A lightweight Node.js application (code located in `/agent`) designed to run on operator machines (Windows, macOS, Linux) with residential internet connections. It handles:
+    -   Maintaining an Agent registry (in DynamoDB).
+    -   Providing health check and monitoring endpoints.
+2.  **Agent:** A lightweight Node.js application (source code located in the `/agent` directory) designed to run on operator machines (Windows, macOS, Linux) with residential internet connections. It handles:
     -   Connecting to the Orchestrator via WebSocket (WSS).
     -   Authenticating using an `AGENT_KEY`.
     -   Receiving job details from the Orchestrator.
-    -   Executing the specified HTTP(S) request locally using its residential IP (using `undici` or `node-fetch`).
+    -   Executing the specified HTTP(S) request locally using its residential IP (using `undici`).
     -   Sending the response back to the Orchestrator.
     -   Reading configuration (`ORCH_WS`, `AGENT_KEY`) from an `.env` file within the `/agent` directory.
+
+*(Note: The project structure was recently cleaned. The top-level `/src` directory was removed as orchestrator code resides in `/iac/lambda` and agent code in `/agent/src`.)*
 
 ## Setup
 
