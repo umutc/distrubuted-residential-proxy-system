@@ -1,0 +1,14 @@
+type: object
+description: Standard error format.
+properties:
+  message:
+    type: string
+    description: A human-readable description of the error.
+    example: 'Invalid limit parameter provided.'
+  code:
+    type: string
+    description: An optional machine-readable error code.
+    nullable: true
+    example: 'ORC-VAL-4001'
+required:
+  - message 
