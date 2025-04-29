@@ -362,7 +362,7 @@ export class OrchestratorStack extends cdk.Stack {
         path: '/agents',
         methods: [ apigw_http.HttpMethod.GET ],
         integration: new HttpLambdaIntegration('AgentMonitoringIntegration', agentMonitoringHandler),
-        // TODO: Add authorizer once authentication is implemented for this endpoint (Subtask 9.10)
+        // TODO: (Task 9.10) Add authorizer once authentication mechanism (e.g., Lambda authorizer, JWT) is defined and implemented.
     });
     // <<< END: Add Agent Monitoring Route >>>
 
