@@ -1,0 +1,175 @@
+openapi: 3.0.3
+info:
+  title: Agent Monitoring API
+  description: API for monitoring the status and details of connected agents in the Distributed Residential Proxy System.
+  version: 1.0.0
+
+paths:
+  /agents:
+    get:
+      summary: List Connected Agents
+      description: Retrieves a list of currently connected agents, with options for filtering, sorting, and pagination.
+      operationId: listAgents
+      tags:
+        - Agents
+      parameters:
+        - name: status
+          in: query
+          description: Filter agents by status.
+          required: false
+          schema:
+            type: string
+            enum: [available, busy, connecting, disconnected] # Define possible statuses
+        - name: agentId
+          in: query
+          description: Filter by a specific agent ID.
+          required: false
+          schema:
+            type: string
+        - name: sortBy
+          in: query
+          description: Field to sort the results by.
+          required: false
+          schema:
+            type: string
+            enum: [connectionTime, lastHeartbeat, agentId, status] # Add other sortable fields as needed
+            default: connectionTime
+        - name: sortOrder
+          in: query
+          description: Order to sort the results by.
+          required: false
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: desc
+        - name: limit
+          in: query
+          description: Maximum number of agents to return per page.
+          required: false
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+            maximum: 100 # Define a reasonable max limit
+            default: 25
+        - name: nextToken
+          in: query
+          description: Token for retrieving the next page of results (obtained from a previous response).
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: A list of agents matching the criteria.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentListResponse'
+        '400':
+          description: Bad Request - Invalid query parameters.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized - Authentication required or failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal Server Error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+        - ApiKeyAuth: [] # Placeholder for API Key auth
+        # - IamAuth: [] # Placeholder for IAM auth
+        # - CognitoAuth: [] # Placeholder for Cognito auth
+
+components:
+  schemas:
+    Agent:
+      type: object
+      properties:
+        connectionId:
+          type: string
+          description: The unique WebSocket connection ID assigned by API Gateway.
+          example: "Yg2z9dEXAMPLE="
+        agentId:
+          type: string
+          description: The self-reported unique identifier of the agent (if provided during registration).
+          example: "agent-lon-123"
+        status:
+          type: string
+          description: The current status of the agent.
+          enum: [available, busy, connecting, disconnected] # Match query param enum
+          example: "available"
+        connectionTime:
+          type: string
+          format: date-time
+          description: Timestamp when the agent established the current connection.
+          example: "2023-10-27T10:35:15.500Z"
+        lastHeartbeat:
+          type: string
+          format: date-time
+          description: Timestamp of the last received heartbeat or message from the agent (TBD feature).
+          example: "2023-10-27T11:05:00.100Z"
+        metadata:
+          type: object
+          description: Optional metadata provided by the agent during registration (e.g., version, location, capabilities).
+          additionalProperties: true # Allow flexible metadata
+          example:
+            version: "1.2.0"
+            location: "us-east-1"
+            ip: "192.0.2.10"
+      required:
+        - connectionId
+        - status
+        - connectionTime
+
+    AgentListResponse:
+      type: object
+      properties:
+        agents:
+          type: array
+          items:
+            $ref: '#/components/schemas/Agent'
+        nextToken:
+          type: string
+          nullable: true
+          description: Token to use in a subsequent request to retrieve the next page of results. Null if no more pages.
+          example: "AQID..."
+      required:
+        - agents
+
+    ErrorResponse:
+      type: object
+      properties:
+        message:
+          type: string
+          description: A human-readable description of the error.
+          example: "Invalid status filter provided."
+        errorCode:
+          type: string
+          description: A machine-readable error code (optional).
+          example: "MON-4001"
+      required:
+        - message
+
+  securitySchemes:
+    ApiKeyAuth: # Example API Key Auth
+      type: apiKey
+      in: header
+      name: X-API-Key # Or adjust as needed
+    # IamAuth: # Placeholder for IAM
+    #   type: awsSigv4
+    # CognitoAuth: # Placeholder for Cognito
+    #   type: http
+    #   scheme: bearer
+    #   bearerFormat: JWT # Or OIDC flow
+
+tags:
+  - name: Agents
+    description: Operations related to monitoring connected agents. 
