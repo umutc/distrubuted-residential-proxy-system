@@ -4,6 +4,7 @@ import { request } from 'undici';
 import { setTimeout, clearTimeout } from 'node:timers'; // Explicit Node timers
 import { Buffer } from 'node:buffer'; // Explicit Node buffer
 import process from 'node:process'; // Explicit Node process
+import logger from './logger'; // Import the pino logger
 
 // Load environment variables from .env file
 dotenv.config();
@@ -13,15 +14,14 @@ const agentKey = process.env.AGENT_KEY;
 const GRACE_PERIOD_MS = parseInt(process.env.AGENT_GRACE_PERIOD_MS || '10000', 10); // Default 10 seconds
 
 if (!orchestratorUrl || !agentKey) {
-  console.error('Error: Missing ORCH_WS or AGENT_KEY environment variables.');
-  console.error('Please ensure a .env file exists in the agent directory with these values.');
+  logger.fatal({ errorCode: 'AGT-CFG-1001' }, 'Missing ORCH_WS or AGENT_KEY environment variables. Please ensure a .env file exists in the agent directory with these values.');
   process.exit(1); // Exit code 1 for configuration error
 }
 
 // Append agent key as query parameter for authentication
 const connectUrl = `${orchestratorUrl}?AGENT_KEY=${encodeURIComponent(agentKey)}`;
 
-console.log(`Attempting to connect to: ${orchestratorUrl}`); // Log without the key
+logger.info({ orchestratorUrl }, `Attempting to connect to Orchestrator`); // Log without the key
 
 let ws: WebSocket | null = null;
 let reconnectAttempts = 0;
@@ -31,6 +31,9 @@ const MAX_RECONNECT_DELAY_MS = 30 * 1000; // 30 seconds
 let reconnectTimeoutId: NodeJS.Timeout | null = null;
 let pingIntervalId: NodeJS.Timeout | null = null; // For heartbeat
 const PING_INTERVAL_MS = 30 * 1000; // 30 seconds
+let statusUpdateIntervalId: NodeJS.Timeout | null = null; // For status updates
+const STATUS_UPDATE_INTERVAL_MS = 60 * 1000; // 60 seconds
+const agentStartTime = Date.now(); // Record agent start time
 let isClosingGracefully = false; // Flag to prevent reconnect on intentional close
 let isShuttingDown = false; // Flag for graceful shutdown process
 const activeJobs = new Set<string>(); // Track IDs of jobs currently being processed
@@ -93,9 +96,23 @@ interface AgentError {
     details?: any; // Any additional context
 }
 
+// --- Agent Status Update Message ---
+interface AgentStatusUpdateData {
+    status: 'connected' | 'shutting_down'; // Agent's perspective
+    activeJobCount: number;
+    uptimeSeconds: number;
+    platform?: string;
+    nodeVersion?: string;
+}
+
+interface AgentStatusUpdateMessage extends BaseMessage {
+    action: 'agent_status_update';
+    data: AgentStatusUpdateData;
+}
+
 function connect() {
   if (isShuttingDown) {
-      console.log("Shutdown in progress, connection aborted.");
+      logger.info("Shutdown in progress, connection aborted.");
       return;
   }
   if (reconnectTimeoutId) {
@@ -103,23 +120,24 @@ function connect() {
     reconnectTimeoutId = null;
   }
   isClosingGracefully = false; // Reset flag on new connection attempt
-  console.log('Initiating connection...');
+  logger.info('Initiating WebSocket connection...');
   ws = new WebSocket(connectUrl);
 
   ws.on('open', () => {
-    console.log('✅ Connected to Orchestrator.');
+    logger.info('✅ Connected to Orchestrator.');
     reconnectAttempts = 0; // Reset attempts on successful connection
     startPing(); // Start heartbeat on successful connection
+    startStatusUpdates(); // Start periodic status updates
   });
 
   ws.on('message', (data) => {
     if (isShuttingDown) {
-        console.log("Received message during shutdown, ignoring.");
+        logger.info("Received message during shutdown, ignoring.");
         return; // Ignore messages during shutdown phase
     }
     try {
       const message: BaseMessage = JSON.parse(data.toString());
-      console.log(`📩 Received action: ${message.action}`);
+      logger.info({ action: message.action, requestId: message.requestId }, `📩 Received action`);
 
       // Simple message router
       switch (message.action) {
@@ -130,35 +148,36 @@ function connect() {
           handleJobRequest(message as JobRequestMessage); // Async handling needed
           break;
         default:
-          console.warn(`Unknown action received: ${message.action}`);
+          logger.warn({ action: message.action }, `Unknown action received`);
       }
-    } catch (error) {
-      console.error('Error parsing or handling incoming message:', error);
-      console.error('Raw message:', data.toString());
+    } catch (error: any) {
+      logger.error({ errorCode: 'AGT-UNK-1000', error: error.message, stack: error.stack, rawMessage: data.toString() }, 'Error parsing or handling incoming WebSocket message');
     }
   });
 
   ws.on('close', (code, reason) => {
     const reasonString = reason.toString() || 'No reason provided';
-    console.log(`❌ Disconnected from Orchestrator. Code: ${code}, Reason: ${reasonString}`);
+    logger.info({ code, reason: reasonString }, `❌ Disconnected from Orchestrator.`);
     stopPing(); // Stop heartbeat on disconnect
+    stopStatusUpdates(); // Stop status updates on disconnect
     ws = null;
     // Reconnect only if not shutting down intentionally (gracefully or due to max attempts)
     if (!isClosingGracefully && !isShuttingDown && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
         attemptReconnect();
     } else if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-         console.error(`Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Not attempting further connections.`);
+         logger.error({ errorCode: 'AGT-NET-1003', attempts: MAX_RECONNECT_ATTEMPTS }, `Max reconnect attempts reached. Not attempting further connections.`);
          // Optionally exit or notify
          // gracefulShutdown(1); // Consider triggering shutdown if reconnect fails permanently
     }
   });
 
   ws.on('error', (error) => {
-    console.error(' WebSocket Error:', error.message);
+    logger.error({ errorCode: 'AGT-NET-1001', error: error.message, stack: error.stack }, 'WebSocket Error during connection or operation');
     stopPing(); // Stop ping on error too
+    stopStatusUpdates(); // Stop status updates on error too
     // Attempt to close cleanly, the 'close' event will handle reconnect logic
     if (ws && ws.readyState !== WebSocket.CLOSED && ws.readyState !== WebSocket.CLOSING) {
-        console.log('Closing WebSocket due to error.');
+        logger.info('Closing WebSocket due to error.');
         ws.close(1011, "WebSocket Error"); // Use appropriate code if needed
     }
     // Note: The 'close' event handler should trigger the reconnect logic if appropriate
@@ -167,11 +186,11 @@ function connect() {
 
 function attemptReconnect() {
     if (isShuttingDown) {
-        console.log("Shutdown in progress, reconnect aborted.");
+        logger.info("Shutdown in progress, reconnect aborted.");
         return;
     }
     if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-        console.error(`Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Giving up.`);
+        logger.error({ errorCode: 'AGT-NET-1003', maxAttempts: MAX_RECONNECT_ATTEMPTS }, `Max reconnect attempts reached. Giving up.`);
         gracefulShutdown(1); // Trigger shutdown if reconnect fails permanently
         return;
     }
@@ -183,7 +202,7 @@ function attemptReconnect() {
         MAX_RECONNECT_DELAY_MS
     );
 
-    console.log(`Reconnection attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} in ${Math.round(delay / 1000)}s...`);
+    logger.info({ attempt: reconnectAttempts, maxAttempts: MAX_RECONNECT_ATTEMPTS, delaySeconds: Math.round(delay / 1000) }, `Attempting reconnection`);
 
     reconnectTimeoutId = setTimeout(() => {
         connect();
@@ -193,7 +212,7 @@ function attemptReconnect() {
 // --- Heartbeat (Ping/Pong) ---
 function startPing() {
     stopPing(); // Clear existing interval if any
-    console.log(`Starting heartbeat ping every ${PING_INTERVAL_MS / 1000}s`);
+    logger.info({ intervalMs: PING_INTERVAL_MS }, `Starting heartbeat ping`);
     pingIntervalId = setInterval(() => {
         if (ws && ws.readyState === WebSocket.OPEN && !isShuttingDown) {
             const pingMsg: PingMessage = {
@@ -201,13 +220,13 @@ function startPing() {
                 timestamp: Date.now(),
                 // requestId: uuidv4() // Add request ID if needed for tracking pongs
             };
-            console.log(`	💓 Sending ping...`);
+            logger.debug(`	💓 Sending ping...`); // Use debug for frequent messages
             sendMessage(pingMsg); // Use sendMessage for consistency
         } else if (isShuttingDown) {
-             console.log('Not sending ping, shutdown in progress.');
+             logger.info('Not sending ping, shutdown in progress.');
              stopPing(); // Stop pinging during shutdown
         } else {
-            console.warn('Cannot send ping, WebSocket not open or shutting down.');
+            logger.warn('Cannot send ping, WebSocket not open or shutting down.');
             // Connection might be closing or already closed, reconnect logic will handle it.
         }
     }, PING_INTERVAL_MS);
@@ -215,7 +234,7 @@ function startPing() {
 
 function stopPing() {
     if (pingIntervalId) {
-        console.log('Stopping heartbeat ping.');
+        logger.info('Stopping heartbeat ping.');
         clearInterval(pingIntervalId);
         pingIntervalId = null;
     }
@@ -224,9 +243,57 @@ function stopPing() {
 function handlePong(message: PongMessage) {
     // Only log if not shutting down, less noise
     if (!isShuttingDown) {
-        console.log(`	💓 Received pong. Round trip latency (if timestamp included): ${message.timestamp ? Date.now() - Number(message.timestamp) : 'N/A'} ms`);
+        const latency = message.timestamp ? Date.now() - Number(message.timestamp) : undefined;
+        logger.debug({ latencyMs: latency }, `	💓 Received pong.`); // Use debug
     }
     // Optionally track latency or confirm connection is alive
+}
+
+// --- Agent Status Update Logic ---
+function startStatusUpdates() {
+    stopStatusUpdates(); // Clear existing interval first
+    logger.info({ intervalMs: STATUS_UPDATE_INTERVAL_MS }, `Starting periodic agent status updates`);
+    statusUpdateIntervalId = setInterval(() => {
+        if (ws && ws.readyState === WebSocket.OPEN && !isShuttingDown) {
+            sendAgentStatusUpdate('connected');
+        } else {
+            logger.warn('Cannot send status update, WebSocket not open or shutting down.');
+            // If WS is not open, the interval will be stopped by close/error handlers anyway
+        }
+    }, STATUS_UPDATE_INTERVAL_MS);
+    // Send initial status immediately on connect
+    sendAgentStatusUpdate('connected');
+}
+
+function stopStatusUpdates() {
+    if (statusUpdateIntervalId) {
+        logger.info('Stopping periodic agent status updates.');
+        clearInterval(statusUpdateIntervalId);
+        statusUpdateIntervalId = null;
+    }
+}
+
+function sendAgentStatusUpdate(currentStatus: 'connected' | 'shutting_down') {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+        logger.warn({ targetStatus: currentStatus }, 'Cannot send status update, WebSocket not open.');
+        return;
+    }
+
+    const statusData: AgentStatusUpdateData = {
+        status: currentStatus,
+        activeJobCount: activeJobs.size,
+        uptimeSeconds: Math.round((Date.now() - agentStartTime) / 1000),
+        platform: process.platform,
+        nodeVersion: process.version,
+    };
+
+    const statusMessage: AgentStatusUpdateMessage = {
+        action: 'agent_status_update',
+        timestamp: Date.now(),
+        data: statusData,
+    };
+    logger.debug({ statusData }, 'Sending agent status update');
+    sendMessage(statusMessage);
 }
 
 // --- Job Handling ---
@@ -235,17 +302,18 @@ function handlePong(message: PongMessage) {
 async function handleJobRequest(message: JobRequestMessage) {
     // 1. Check if shutting down
     if (isShuttingDown) {
-      console.log(`Received job request ${message.data?.jobId} during shutdown, rejecting.`);
-      sendErrorResponse(message.requestId, message.data?.jobId, 'Agent is shutting down', 'AGENT_SHUTTING_DOWN');
+      logger.warn({ jobId: message.data?.jobId, requestId: message.requestId }, `Received job request during shutdown, rejecting.`);
+      // Use specific error code from docs/error-codes.md
+      sendErrorResponse(message.requestId, message.data?.jobId, 'Agent is shutting down', 'AGT-SHT-1001'); 
       return;
     }
 
-    console.log(`Received job request for jobId: ${message.data?.jobId || 'N/A'}`);
+    logger.info({ jobId: message.data?.jobId, requestId: message.requestId, url: message.data?.url, method: message.data?.method }, `Received job request`);
 
     // --- Robust Validation ---
     if (!message.data) {
-        console.error('Invalid job request: Missing data field.');
-        sendErrorResponse(message.requestId, undefined, 'Invalid job request: Missing data field', 'AGENT_VALIDATION_ERROR');
+        logger.error({ requestId: message.requestId, errorCode: 'AGT-VAL-1001' }, 'Invalid job request: Missing data field.');
+        sendErrorResponse(message.requestId, undefined, 'Invalid job request: Missing data field', 'AGT-VAL-1001');
         return;
     }
 
@@ -253,17 +321,20 @@ async function handleJobRequest(message: JobRequestMessage) {
 
     // Basic validation (keep concise for example)
     if (!jobId || !url || !method) {
-         sendErrorResponse(message.requestId, jobId, 'Invalid job request: Missing required fields (jobId, url, method)', 'AGENT_VALIDATION_ERROR');
+         logger.warn({ jobId, requestId: message.requestId, errorCode: 'AGT-VAL-1001' }, 'Invalid job request: Missing required fields (jobId, url, method)');
+         sendErrorResponse(message.requestId, jobId, 'Invalid job request: Missing required fields (jobId, url, method)', 'AGT-VAL-1001');
          return;
     }
      try {
         new URL(url); // Basic URL format check
     } catch (e) {
-        sendErrorResponse(message.requestId, jobId, 'Invalid job request: Malformed URL', 'AGENT_VALIDATION_ERROR');
+        logger.warn({ jobId, url, requestId: message.requestId, errorCode: 'AGT-VAL-1001' }, 'Invalid job request: Malformed URL');
+        sendErrorResponse(message.requestId, jobId, 'Invalid job request: Malformed URL', 'AGT-VAL-1001');
         return;
     }
      if (!['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'].includes(method.toUpperCase())) {
-        sendErrorResponse(message.requestId, jobId, `Invalid job request: Invalid method: ${method}`, 'AGENT_VALIDATION_ERROR');
+        logger.warn({ jobId, method, requestId: message.requestId, errorCode: 'AGT-VAL-1001' }, `Invalid job request: Invalid method`);
+        sendErrorResponse(message.requestId, jobId, `Invalid job request: Invalid method: ${method}`, 'AGT-VAL-1001');
         return;
     }
     // Add other validations as needed...
@@ -271,7 +342,7 @@ async function handleJobRequest(message: JobRequestMessage) {
 
     // 2. Add job to active set *before* execution
     activeJobs.add(jobId);
-    console.log(`Job ${jobId} added to active set (${activeJobs.size} active).`);
+    logger.info({ jobId, activeJobCount: activeJobs.size }, `Job added to active set.`);
 
     try {
         let requestBody: Buffer | string | undefined = undefined;
@@ -282,6 +353,7 @@ async function handleJobRequest(message: JobRequestMessage) {
                 } catch (e: any) {
                     // Cannot return here directly, need to go to finally block to remove from activeJobs
                     // Throw an error instead to be caught by the outer catch block
+                    logger.error({ jobId, error: e.message, requestId: message.requestId, errorCode: 'AGT-JOB-1003' }, 'Failed to decode base64 body');
                     throw new Error(`Failed to decode base64 body: ${e.message}`);
                 }
             } else {
@@ -294,21 +366,26 @@ async function handleJobRequest(message: JobRequestMessage) {
     } catch (error) {
         // Catch errors *during* the setup/preparation before executeHttpRequest
         // OR errors thrown deliberately (like the base64 decode failure)
-        console.error(`[${jobId}] Error during job request handling or setup:`, error);
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        let errorCode = 'AGT-UNK-1000'; // Default unknown error
+        if (errorMessage.includes('Failed to decode base64 body')) {
+             errorCode = 'AGT-JOB-1003';
+        }
+        logger.error({ jobId, error: errorMessage, errorCode, requestId: message.requestId }, `Error during job request handling or setup`);
         // Ensure an error response is sent IF executeHttpRequest wasn't the source of the error
         // (executeHttpRequest sends its own errors)
         // Check if the error originated from our setup phase
         if (!(error instanceof Error && error.message.startsWith('Failed executing HTTP request'))) { // Heuristic check
-             sendErrorResponse(message.requestId, jobId, `Internal agent error during job setup: ${error instanceof Error ? error.message : String(error)}`, 'AGENT_INTERNAL_ERROR', 500);
+             sendErrorResponse(message.requestId, jobId, `Internal agent error during job setup: ${errorMessage}`, errorCode, 500);
         }
     } finally {
         // 3. Remove job from active set in finally block
         activeJobs.delete(jobId);
-        console.log(`Job ${jobId} removed from active set (${activeJobs.size} active).`);
+        logger.info({ jobId, activeJobCount: activeJobs.size }, `Job removed from active set.`);
 
         // 4. Check if shutdown is pending and this was the last job
         if (isShuttingDown && activeJobs.size === 0) {
-            console.log('Last active job completed during shutdown.');
+            logger.info('Last active job completed during shutdown.');
             if (shutdownTimeoutId) {
                 clearTimeout(shutdownTimeoutId); // Cancel the force-shutdown timer
                 shutdownTimeoutId = null;
@@ -327,7 +404,7 @@ async function executeHttpRequest(
     timeoutMs?: number,
     requestId?: string
 ) {
-    console.log(`[${jobId}] Executing ${method} request to ${url}`);
+    logger.info({ jobId, method, url, requestId }, `Executing HTTP request`);
     const effectiveTimeout = timeoutMs || 30000; // Default 30s timeout
 
     try {
@@ -345,7 +422,7 @@ async function executeHttpRequest(
             // throwOnError: true, // Consider if this simplifies error logic vs checking statusCode
         });
 
-        console.log(`[${jobId}] Received response: ${statusCode}`);
+        logger.info({ jobId, statusCode, requestId }, `Received response from target`);
 
         // Consume the stream and collect into a buffer
         const chunks: Buffer[] = []; // Explicitly type chunks as Buffer[]
@@ -367,44 +444,47 @@ async function executeHttpRequest(
         sendSuccessResponse(requestId, jobId, statusCode, simpleHeaders, completeBodyBuffer);
 
     } catch (error: any) {
-        console.error(`[${jobId}] Error executing HTTP request:`, error);
-
-        // Wrap error message for clarity in finally block check
-        const errorMessagePrefix = 'Failed executing HTTP request: ';
-        let errorCode = 'AGENT_REQUEST_FAILED';
-        let message = `${errorMessagePrefix}Unknown error`;
+        // Default error code
+        let errorCode = 'AGT-JOB-1000'; // General job execution failure
+        let message = `Failed executing HTTP request: Unknown error`;
         let statusCode: number | undefined = undefined; // HTTP status from error if available
 
+        // Log the raw error first for debugging
+        logger.error({ jobId, rawError: error, errorCode: 'RAW_HTTP_EXEC_ERROR', requestId }, `Raw error during HTTP request execution`);
+
+        // --- Map common error scenarios to specific codes --- 
         if (error && typeof error === 'object') {
              // undici specific errors often have codes
             if ('code' in error) {
-                message = `${errorMessagePrefix}${error.code} - ${error.message}`;
+                message = `${error.code} - ${error.message}`;
                 if (error.code === 'UND_ERR_CONNECT_TIMEOUT') { // Note: connectTimeout is implicit in headersTimeout usually
-                    errorCode = 'AGENT_CONNECT_TIMEOUT';
+                    errorCode = 'AGT-NET-1005'; 
                 } else if (error.code === 'UND_ERR_HEADERS_TIMEOUT' || error.code === 'UND_ERR_BODY_TIMEOUT') {
-                    errorCode = 'AGENT_TARGET_TIMEOUT';
+                    errorCode = 'AGT-JOB-1001';
                 } else if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED' || error.code === 'ECONNRESET') {
-                     errorCode = 'AGENT_TARGET_UNREACHABLE';
+                     errorCode = 'AGT-NET-1006';
                 } // Add more specific undici error codes if needed
             } else {
-                 message = `${errorMessagePrefix}${error.message || 'Unknown error'}`;
+                 message = `${error.message || 'Unknown error'}`;
             }
              // Check if it resembles an HTTP error structure from undici or target
             if ('statusCode' in error && typeof error.statusCode === 'number') {
                 statusCode = error.statusCode;
-                errorCode = 'AGENT_TARGET_ERROR'; // Consider it a target error if status code present
-                message = `${errorMessagePrefix}Target responded with status ${statusCode}`;
+                errorCode = 'AGT-JOB-1002'; // Use this for any target response error
+                message = `${error.message || 'Unknown error'}`;
             } else if ('response' in error && error.response && 'statusCode' in error.response && typeof error.response.statusCode === 'number') {
                 // Handle cases where undici wraps the response in error
                 statusCode = error.response.statusCode;
-                errorCode = 'AGENT_TARGET_ERROR';
-                message = `${errorMessagePrefix}Target responded with status ${statusCode}`;
+                errorCode = 'AGT-JOB-1002';
+                message = `${error.message || 'Unknown error'}`;
             }
         } else {
-            message = `${errorMessagePrefix}${String(error)}`;
+            message = `${String(error)}`;
         }
 
         // Cast error to unknown when passing as details
+        // Log the specific error details being sent back
+        logger.warn({ jobId, errorCode, message, statusCode: statusCode, details: error as unknown, requestId }, "Sending error response for HTTP request failure");
         sendErrorResponse(requestId, jobId, message, errorCode, statusCode, error as unknown);
         // Explicitly create and type the error object before throwing
         const executionError: Error = new Error(String(message));
@@ -428,7 +508,7 @@ function sendSuccessResponse(requestId: string | undefined, jobId: string, statu
         }
     };
     sendMessage(response);
-    console.log(`[${jobId}] Success response sent (Target Status: ${statusCode}).`);
+    logger.info({ jobId, targetStatusCode: statusCode, requestId }, `Success response sent`);
 }
 
 function sendErrorResponse(requestId: string | undefined, jobId: string | undefined, message: string, errorCode: string, statusCode?: number, details?: any) {
@@ -451,22 +531,22 @@ function sendErrorResponse(requestId: string | undefined, jobId: string | undefi
         }
     };
     sendMessage(errorResponse);
-     console.error(`[${effectiveJobId}] Error response sent: ${errorCode} - ${message}`);
+     logger.error({ jobId: effectiveJobId, errorCode, message, statusCode, requestId }, `Error response sent`);
 }
 
 function sendMessage(message: BaseMessage) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     try {
       ws.send(JSON.stringify(message));
-    } catch (error) {
-      console.error('Error sending message:', error);
+    } catch (error: any) {
+      logger.error({ action: message.action, error: error.message, errorCode: 'AGT-NET-1004' }, 'Error sending message via WebSocket');
       // Attempt to close connection if send fails, reconnect logic will handle it
        if (ws && ws.readyState === WebSocket.OPEN) {
             ws.close(1011, "Send Error");
        }
     }
   } else {
-    console.warn(`Cannot send message (Action: ${message.action}), WebSocket not open.`);
+    logger.warn({ action: message.action }, `Cannot send message, WebSocket not open.`);
     // Don't attempt reconnect here, let the close/error handlers manage it
   }
 }
@@ -474,12 +554,18 @@ function sendMessage(message: BaseMessage) {
 // --- Graceful Shutdown Logic ---
 function gracefulShutdown(exitCode: number = 0) {
     if (isShuttingDown) {
-        console.log('Shutdown already in progress.');
+        logger.info('Shutdown already in progress.');
         return; // Prevent redundant shutdown calls
     }
     isShuttingDown = true;
-    console.log(`🚨 Initiating graceful shutdown (Exit code: ${exitCode})...`);
+    logger.info({ exitCode }, `🚨 Initiating graceful shutdown...`);
     stopPing(); // Stop sending pings
+    stopStatusUpdates(); // Stop periodic updates
+
+    // Send final status update indicating shutdown
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        sendAgentStatusUpdate('shutting_down');
+    }
 
     if (reconnectTimeoutId) {
         clearTimeout(reconnectTimeoutId); // Cancel any pending reconnect
@@ -487,23 +573,23 @@ function gracefulShutdown(exitCode: number = 0) {
     }
 
     if (activeJobs.size === 0) {
-        console.log('No active jobs. Shutting down immediately.');
+        logger.info('No active jobs. Shutting down immediately.');
         closeConnectionAndExit(exitCode);
     } else {
-        console.log(`Waiting for ${activeJobs.size} active job(s) to complete (max ${GRACE_PERIOD_MS / 1000}s)...`);
-        console.log('Active job IDs:', Array.from(activeJobs));
+        logger.info({ jobCount: activeJobs.size, gracePeriodSec: GRACE_PERIOD_MS / 1000 }, `Waiting for active jobs to complete...`);
+        logger.info({ activeJobIds: Array.from(activeJobs) }, 'Active job IDs');
 
         // Set a timer to force exit if jobs don't finish
         shutdownTimeoutId = setTimeout(() => {
-            console.warn(`Grace period (${GRACE_PERIOD_MS / 1000}s) expired. Forcing shutdown.`);
-            console.warn(`Jobs still active: ${Array.from(activeJobs).join(', ')}`);
+            logger.warn({ gracePeriodSec: GRACE_PERIOD_MS / 1000 }, `Grace period expired. Forcing shutdown.`);
+            logger.warn({ activeJobIds: Array.from(activeJobs) }, `Jobs still active`);
             closeConnectionAndExit(1); // Use non-zero exit code for forced shutdown
         }, GRACE_PERIOD_MS);
     }
 }
 
 function closeConnectionAndExit(exitCode: number) {
-     console.log(`Closing WebSocket connection and exiting with code ${exitCode}...`);
+     logger.info({ exitCode }, `Closing WebSocket connection and exiting...`);
      isClosingGracefully = true; // Prevent reconnect attempts from the 'close' handler
      if (shutdownTimeoutId) { // Clear timeout if we are exiting before it fires
         clearTimeout(shutdownTimeoutId);
@@ -517,30 +603,38 @@ function closeConnectionAndExit(exitCode: number) {
     }
      // Add a small delay to allow the close frame to potentially be sent
     setTimeout(() => {
-        console.log("Exiting process.");
+        logger.info({ exitCode }, "Exiting process.");
         process.exit(exitCode);
     }, 250); // Delay exit slightly
 }
 
-// --- Signal Handling ---
-process.on('SIGINT', () => {
-    console.log('Received SIGINT (Ctrl+C).');
-    gracefulShutdown(0); // Treat SIGINT as a request for graceful exit (code 0)
-});
-
-process.on('SIGTERM', () => {
-    console.log('Received SIGTERM.');
-    gracefulShutdown(0); // Treat SIGTERM as a request for graceful exit (code 0)
-});
-
+// --- Global Error Handlers ---
 process.on('uncaughtException', (error) => {
-    console.error('🚨 Uncaught Exception:', error);
+    logger.fatal({ 
+        errorCode: 'AGT-UNK-1001',
+        errorName: error.name,
+        errorMessage: error.message, 
+        stack: error.stack 
+    }, '🚨 Uncaught Exception'); // Use fatal for critical errors
     // Attempt a last-ditch graceful shutdown, might not always work
     gracefulShutdown(1); // Use non-zero exit code for unexpected errors
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-    console.error('🚨 Unhandled Rejection at:', promise, 'reason:', reason);
+    let errorDetails: any = reason;
+    // Attempt to extract more details if reason is an Error object
+    if (reason instanceof Error) {
+        errorDetails = {
+            name: reason.name,
+            message: reason.message,
+            stack: reason.stack
+        };
+    }
+    logger.fatal({ 
+        errorCode: 'AGT-UNK-1002',
+        reason: errorDetails, // Log extracted details or original reason
+        promise 
+    }, '🚨 Unhandled Rejection'); // Use fatal
      // Attempt a last-ditch graceful shutdown
     gracefulShutdown(1);
 });
@@ -548,4 +642,4 @@ process.on('unhandledRejection', (reason, promise) => {
 // --- Initial Connection ---
 connect();
 
-console.log("Agent process started. Waiting for connection...");
+logger.info("Agent process started. Waiting for connection...");

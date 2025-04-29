@@ -1,13 +1,15 @@
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { DynamoDBClient, DescribeTableCommand } from '@aws-sdk/client-dynamodb';
-import { logger } from '../utils/logger'; // Assuming logger utility exists
+import logger from '../utils/logger'; // Ensure correct import
 
 const dynamoDb = new DynamoDBClient({});
 const AGENT_REGISTRY_TABLE_NAME = process.env.AGENT_REGISTRY_TABLE_NAME;
 const SYNC_JOB_MAPPING_TABLE_NAME = process.env.SYNC_JOB_MAPPING_TABLE_NAME;
 
 export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> {
-    logger.info('Health check requested');
+    // Create a logger instance for this invocation if needed, or use the base logger
+    const log = logger; // Using base logger is fine for health checks
+    log.info('Health check requested');
 
     const checks = [
         { name: 'AgentRegistryTable', tableName: AGENT_REGISTRY_TABLE_NAME },
@@ -19,8 +21,9 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
     const checkResults: { [key: string]: string } = {};
 
     for (const check of checks) {
+        const checkLog = log.child({ healthCheckName: check.name });
         if (!check.tableName) {
-            logger.error(`Health check failed: Environment variable for ${check.name} not set.`);
+            checkLog.error({ errorCode: 'ORC-CFG-1001', tableNameEnvVar: check.name }, `Configuration Error: Environment variable not set.`);
             checkResults[check.name] = 'Configuration Error';
             isHealthy = false;
             continue;
@@ -28,23 +31,23 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
         try {
             await dynamoDb.send(new DescribeTableCommand({ TableName: check.tableName }));
             checkResults[check.name] = 'OK';
-            logger.debug(`${check.name} connection check OK.`);
-        } catch (error) {
-            logger.error(`Health check failed for ${check.name}:`, error);
+            checkLog.info(`Dependency check OK.`);
+        } catch (error: any) {
+            checkLog.error({ errorCode: 'ORC-DEP-1000', tableName: check.tableName, error: error.message, stack: error.stack }, `Dependency check failed.`);
             checkResults[check.name] = 'Error';
             isHealthy = false;
         }
     }
 
     if (isHealthy) {
-        logger.info('Health check passed');
+        log.info({ checkResults }, 'Health check passed');
         return {
             statusCode: 200,
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ status: 'healthy', checks: checkResults }),
         };
     } else {
-        logger.warn('Health check failed', { checks: checkResults });
+        log.warn({ checkResults }, 'Health check failed');
         return {
             statusCode: 503,
             headers: { 'Content-Type': 'application/json' },

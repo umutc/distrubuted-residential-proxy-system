@@ -1,18 +1,20 @@
 import { APIGatewayProxyWebsocketEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 import { DynamoDBClient, DeleteItemCommand } from '@aws-sdk/client-dynamodb';
+import logger from '../utils/logger'; // Import the shared logger
 
 // Initialize client outside the handler
 const dynamoDb = new DynamoDBClient({});
 const AGENT_REGISTRY_TABLE_NAME = process.env.AGENT_REGISTRY_TABLE_NAME;
 
 export const handler = async (event: APIGatewayProxyWebsocketEventV2): Promise<APIGatewayProxyResultV2> => {
-  console.log('Disconnect Event:', JSON.stringify(event, null, 2));
-
+  // Log the event at debug level if needed, otherwise just log the connection ID
+  // logger.debug({ event }, 'Disconnect Event details');
   const connectionId = event.requestContext.connectionId;
-  console.log(`Disconnect invoked for connection: ${connectionId}`);
+  const log = logger.child({ connectionId }); // Create child logger
+  log.info(`Disconnect invoked for connection`);
 
   if (!AGENT_REGISTRY_TABLE_NAME) {
-      console.error('AGENT_REGISTRY_TABLE_NAME environment variable not set.');
+      log.error({ errorCode: 'ORC-CFG-1001' }, 'AGENT_REGISTRY_TABLE_NAME environment variable not set.');
       // Still return 200 for disconnect, but log the config error
       return { statusCode: 200, body: 'Disconnected (config error).' };
   }
@@ -25,9 +27,10 @@ export const handler = async (event: APIGatewayProxyWebsocketEventV2): Promise<A
         connectionId: { S: connectionId },
       },
     }));
-    console.log(`Removed agent connection: ${connectionId}`);
-  } catch (err) {
-    console.error('Failed to remove agent:', err);
+    log.info(`Removed agent connection from registry`);
+  } catch (err: any) {
+    // Use specific error code for DynamoDB failure
+    log.error({ errorCode: 'ORC-DEP-1004', error: err.message, stack: err.stack }, 'Failed to remove agent from registry');
     // Not fatal for disconnect
   }
 

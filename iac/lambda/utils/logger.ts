@@ -1,16 +1,13 @@
+import pino from 'pino';
+
 // Simple placeholder logger utility
 
-export const logger = {
-    debug: (message: string, ...optionalParams: any[]) => {
-        console.debug(message, ...optionalParams);
-    },
-    info: (message: string, ...optionalParams: any[]) => {
-        console.info(message, ...optionalParams);
-    },
-    warn: (message: string, ...optionalParams: any[]) => {
-        console.warn(message, ...optionalParams);
-    },
-    error: (message: string, ...optionalParams: any[]) => {
-        console.error(message, ...optionalParams);
-    },
-}; 
+// Basic Pino logger configuration optimized for Lambda/CloudWatch
+const logger = pino({
+    level: process.env.LOG_LEVEL || 'info', // Default to info, adjustable via ENV
+    // Standard AWS Lambda fields can be mixed in automatically by Pino
+    // if desired, but we'll keep it simple for now.
+    // Use default JSON output (no pretty printing needed for CloudWatch)
+});
+
+export default logger; 

@@ -88,18 +88,25 @@ export class OrchestratorStack extends cdk.Stack {
     });
     */
 
+    // --- Dead Letter Queue for Orchestrator Input ---
+    const orchestratorInputDLQ = new sqs.Queue(this, 'OrchestratorInputDLQ', {
+      queueName: `OrchestratorInputDLQ-${this.stackName}.fifo`,
+      fifo: true,
+      retentionPeriod: cdk.Duration.days(14),
+      // Consider adding alarms on this queue
+    });
+
     // --- Orchestrator Input SQS Queue (FIFO) ---
     const orchestratorInputQueue = new sqs.Queue(this, 'OrchestratorInputQueue', {
       queueName: `OrchestratorInputQueue-${this.stackName}.fifo`,
-      fifo: true, // Enable FIFO
-      contentBasedDeduplication: true, // Automatic deduplication based on content
-      visibilityTimeout: cdk.Duration.seconds(60), // Adjust based on expected processing time
+      fifo: true,
+      contentBasedDeduplication: true,
+      visibilityTimeout: cdk.Duration.seconds(60),
       retentionPeriod: cdk.Duration.days(4),
-      // encryption: sqs.QueueEncryption.KMS_MANAGED, // Consider encryption
-      // deadLetterQueue: { // Configure DLQ later
-      //   queue: deadLetterQueue,
-      //   maxReceiveCount: 5,
-      // },
+      deadLetterQueue: {
+        queue: orchestratorInputDLQ,
+        maxReceiveCount: 5,
+      },
     });
 
     // --- Sync Job Mapping DynamoDB Table ---

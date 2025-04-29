@@ -3,8 +3,8 @@ import { v4 as uuidv4 } from 'uuid';
 import { JobData } from '../utils/types';
 import { dispatchJob } from '../utils/job-dispatcher';
 import { SQSClient, CreateQueueCommand, DeleteQueueCommand, ReceiveMessageCommand, DeleteMessageCommand, GetQueueAttributesCommand, SendMessageCommand } from '@aws-sdk/client-sqs';
-import { logger } from '../utils/logger';
-import { CloudWatchClient, PutMetricDataCommand } from '@aws-sdk/client-cloudwatch';
+import logger from '../utils/logger'; // Import the shared logger
+import { CloudWatchClient, PutMetricDataCommand, MetricDatum } from '@aws-sdk/client-cloudwatch';
 // import { DynamoDBClient } from '@aws-sdk/client-dynamodb'; // For Job Repository
 
 // const jobRepositoryTableName = process.env.JOB_REPOSITORY_TABLE_NAME;
@@ -25,10 +25,16 @@ const TEMP_QUEUE_RETENTION_SECONDS = '60'; // Keep queue for 1 min just in case
 export const handler = async (event: APIGatewayProxyEventV2, context: Context): Promise<APIGatewayProxyResultV2> => {
     const requestId = uuidv4();
     const startTime = Date.now();
-    console.log(`Received job ingestion request: ${requestId}, Body: ${event.body}`);
+    const log = logger.child({ handlerRequestId: requestId });
+    log.info({ path: event.rawPath, queryString: event.rawQueryString, bodyLength: event.body?.length }, `Received job ingestion request`);
 
     if (!agentRegistryTableName || !webSocketApiEndpoint || !orchestratorQueueUrl) {
-        console.error('Missing required environment variables: AGENT_REGISTRY_TABLE_NAME, WEBSOCKET_API_ENDPOINT or ORCHESTRATOR_QUEUE_URL');
+        log.error({ 
+            errorCode: 'ORC-CFG-1001',
+            agentRegistryTableSet: !!agentRegistryTableName,
+            websocketEndpointSet: !!webSocketApiEndpoint,
+            orchestratorQueueSet: !!orchestratorQueueUrl 
+        }, 'Missing required environment variables');
         return {
             statusCode: 500,
             body: JSON.stringify({ message: 'Internal server configuration error.', requestId }),
@@ -37,6 +43,7 @@ export const handler = async (event: APIGatewayProxyEventV2, context: Context): 
 
     // Basic validation
     if (!event.body) {
+        log.warn({ errorCode: 'ORC-VAL-1002' }, 'Missing request body');
         return {
             statusCode: 400,
             body: JSON.stringify({ message: 'Missing request body.', requestId }),
@@ -55,33 +62,40 @@ export const handler = async (event: APIGatewayProxyEventV2, context: Context): 
         const { url, method, headers, body, bodyEncoding, timeoutMs } = jobRequest;
 
         if (!url || typeof url !== 'string') {
-            return { statusCode: 400, body: JSON.stringify({ message: 'Invalid request: Missing or invalid url', requestId }) };
+            log.warn({ urlReceived: url, errorCode: 'ORC-VAL-1002' }, 'Invalid request: Missing or invalid url');
+            return { statusCode: 400, body: JSON.stringify({ message: 'Invalid request: Missing or invalid url', requestId: requestId }) };
         }
         // Basic URL validation
         try {
             new URL(url);
         } catch (e) {
-            return { statusCode: 400, body: JSON.stringify({ message: 'Invalid request: Malformed URL', requestId }) };
+            log.warn({ urlReceived: url, errorCode: 'ORC-VAL-1002' }, 'Invalid request: Malformed URL');
+            return { statusCode: 400, body: JSON.stringify({ message: 'Invalid request: Malformed URL', requestId: requestId }) };
         }
 
         if (!method || typeof method !== 'string' || !['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'].includes(method.toUpperCase())) {
-            return { statusCode: 400, body: JSON.stringify({ message: `Invalid request: Missing or invalid method: ${method}`, requestId }) };
+            log.warn({ methodReceived: method, errorCode: 'ORC-VAL-1002' }, `Invalid request: Missing or invalid method`);
+            return { statusCode: 400, body: JSON.stringify({ message: `Invalid request: Missing or invalid method: ${method}`, requestId: requestId }) };
         }
 
         if (headers && typeof headers !== 'object') {
-            return { statusCode: 400, body: JSON.stringify({ message: 'Invalid request: headers must be an object', requestId }) };
+            log.warn({ headersType: typeof headers, errorCode: 'ORC-VAL-1002' }, 'Invalid request: headers must be an object');
+            return { statusCode: 400, body: JSON.stringify({ message: 'Invalid request: headers must be an object', requestId: requestId }) };
         }
 
         if (body && typeof body !== 'string') {
-            return { statusCode: 400, body: JSON.stringify({ message: 'Invalid request: body must be a string (potentially Base64 encoded)', requestId }) };
+            log.warn({ bodyType: typeof body, errorCode: 'ORC-VAL-1002' }, 'Invalid request: body must be a string');
+            return { statusCode: 400, body: JSON.stringify({ message: 'Invalid request: body must be a string (potentially Base64 encoded)', requestId: requestId }) };
         }
 
         if (bodyEncoding && !['base64', 'utf8'].includes(bodyEncoding)) {
-            return { statusCode: 400, body: JSON.stringify({ message: `Invalid request: invalid bodyEncoding: ${bodyEncoding}. Must be 'base64' or 'utf8'.`, requestId }) };
+            log.warn({ bodyEncodingReceived: bodyEncoding, errorCode: 'ORC-VAL-1002' }, `Invalid request: invalid bodyEncoding`);
+            return { statusCode: 400, body: JSON.stringify({ message: `Invalid request: invalid bodyEncoding: ${bodyEncoding}. Must be 'base64' or 'utf8'.`, requestId: requestId }) };
         }
 
         if (timeoutMs && (typeof timeoutMs !== 'number' || timeoutMs <= 0)) {
-            return { statusCode: 400, body: JSON.stringify({ message: 'Invalid request: timeoutMs must be a positive number', requestId }) };
+            log.warn({ timeoutMsReceived: timeoutMs, errorCode: 'ORC-VAL-1002' }, 'Invalid request: timeoutMs must be a positive number');
+            return { statusCode: 400, body: JSON.stringify({ message: 'Invalid request: timeoutMs must be a positive number', requestId: requestId }) };
         }
 
         const jobId = uuidv4(); // Generate unique job ID
@@ -275,18 +289,40 @@ export const handler = async (event: APIGatewayProxyEventV2, context: Context): 
              }));
 
             console.log(`Request ${requestId} (Async): Job ${jobId} accepted and sent to queue.`);
-            return {
-                statusCode: 202, // Accepted
-                body: JSON.stringify({
+        return {
+            statusCode: 202, // Accepted
+            body: JSON.stringify({
                     message: 'Job accepted and sent to orchestrator queue.', // Updated message
-                    jobId: jobId,
-                    requestId: requestId,
-                }),
-            };
+                jobId: jobId,
+                requestId: requestId,
+            }),
+        };
         }
 
     } catch (error: any) {
         console.error(`Error processing job ingestion request ${requestId}:`, error);
+        // --- Handling Unhandled Errors ---
+        // Try to get jobId even in the error case for better logging/metrics
+        let jobIdForErrorLogging = 'unknown';
+        try {
+            // Attempt to parse jobId from body if possible, even if validation failed earlier
+            const potentialBody = JSON.parse(event.body || '{}');
+            if (potentialBody && typeof potentialBody.jobId === 'string') {
+                jobIdForErrorLogging = potentialBody.jobId;
+            }
+            // Add other potential locations if needed
+        } catch {
+            // Ignore parsing errors, stick with 'unknown'
+        }
+
+        // Use the main logger instance here, as jobLog might not be defined if error occurred before its creation
+        logger.error({ error: error.message, stack: error.stack, jobIdAttempted: jobIdForErrorLogging }, 'Unhandled error during job ingestion');
+
+        // Try to publish an error metric, but don't let it block the response
+        publishMetrics(jobIdForErrorLogging, 'error', Date.now() - startTime).catch(metricError => {
+             logger.error({ metricError: metricError.message }, 'Failed to publish error metric');
+        });
+
         return {
             statusCode: 500,
             body: JSON.stringify({ message: 'Failed to process job request.', error: error.message, requestId }),
@@ -296,13 +332,15 @@ export const handler = async (event: APIGatewayProxyEventV2, context: Context): 
 
 // Helper function to delete the temporary SQS queue
 async function deleteTempQueue(queueUrl: string, requestId: string, context: string) {
+    if (!queueUrl) return;
+    const log = logger.child({ handlerRequestId: requestId, queueUrl, deleteContext: context }); // Use provided request ID
+    log.info(`Attempting to delete temporary queue`);
     try {
-        console.log(`Request ${requestId} ${context}: Deleting temporary queue ${queueUrl}`);
         await sqsClient.send(new DeleteQueueCommand({ QueueUrl: queueUrl }));
-        console.log(`Request ${requestId} ${context}: Successfully deleted queue ${queueUrl}`);
+        log.info(`Successfully deleted temporary queue.`);
     } catch (deleteError: any) {
-        // Log error but don't fail the main flow, queue will expire anyway
-        console.error(`Request ${requestId} ${context}: Failed to delete temporary queue ${queueUrl}:`, deleteError);
+        // Use specific error code
+        log.error({ errorCode: 'ORC-DEP-1007', error: deleteError.message, stack: deleteError.stack }, `Failed to delete temporary queue`);
     }
 } 
 
@@ -405,9 +443,12 @@ async function processSynchronously(jobPayload: any, timeoutSeconds: number): Pr
 }
 
 async function publishMetrics(jobId: string, status: string, durationMs: number): Promise<void> {
+    const log = logger.child({ jobId, metricStatus: status, durationMs });
+    log.info('Publishing metrics to CloudWatch');
     try {
         const timestamp = new Date();
-        const metricData = [
+        // Use MetricDatum type from @aws-sdk/client-cloudwatch
+        const metricData: MetricDatum[] = [
             {
                 MetricName: 'SynchronousJobResult',
                 Dimensions: [
@@ -434,9 +475,9 @@ async function publishMetrics(jobId: string, status: string, durationMs: number)
             Namespace: METRIC_NAMESPACE,
             MetricData: metricData
         }));
-        logger.debug('Successfully published CloudWatch metrics', { jobId, status, durationMs });
-    } catch (error) {
-        logger.warn('Failed to publish CloudWatch metrics', { jobId, error });
+        log.debug('Successfully published CloudWatch metrics');
+    } catch (error: any) {
+        log.warn({ errorCode: 'ORC-DEP-1000' /* Generic AWS */, error: error.message, stack: error.stack }, 'Failed to publish CloudWatch metrics');
         // Don't fail the whole request if metrics fail
     }
 } 

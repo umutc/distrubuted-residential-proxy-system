@@ -1,6 +1,7 @@
 import { DynamoDBClient, QueryCommand, UpdateItemCommand, ReturnValue, DeleteItemCommand } from '@aws-sdk/client-dynamodb';
 import { marshall, unmarshall } from '@aws-sdk/util-dynamodb';
 import { AgentInfo } from './types';
+import logger from './logger';
 
 const dynamoDb = new DynamoDBClient({});
 const TABLE_NAME = process.env.AGENT_REGISTRY_TABLE_NAME;
@@ -136,5 +137,68 @@ export async function deleteAgentConnection(connectionId: string): Promise<boole
     } catch (error) {
         console.error(`Error deleting agent connection record ${connectionId}:`, error);
         return false; // Indicate failure
+    }
+}
+
+// New function to update agent status based on heartbeat/status message
+export async function updateAgentStatusInRegistry(connectionId: string, statusData: any): Promise<boolean> {
+    const log = logger.child({ connectionId, function: 'updateAgentStatusInRegistry', statusData });
+    const tableName = process.env.AGENT_REGISTRY_TABLE_NAME;
+    if (!tableName) {
+        log.error({ errorCode: 'ORC-CFG-1001' }, 'AGENT_REGISTRY_TABLE_NAME not set');
+        return false;
+    }
+
+    // Construct update expression dynamically based on provided statusData
+    let updateExpression = 'SET lastStatusUpdate = :lastUpdate';
+    const expressionAttributeValues: any = {
+        ':lastUpdate': { S: new Date().toISOString() }
+    };
+    const expressionAttributeNames: any = {};
+
+    if (statusData.status !== undefined) {
+        updateExpression += ', #status = :status';
+        expressionAttributeNames['#status'] = 'status'; // Alias reserved keyword
+        expressionAttributeValues[':status'] = { S: statusData.status };
+    }
+    if (statusData.activeJobCount !== undefined) {
+        updateExpression += ', activeJobCount = :jobCount';
+        expressionAttributeValues[':jobCount'] = { N: String(statusData.activeJobCount) };
+    }
+    if (statusData.uptimeSeconds !== undefined) {
+        updateExpression += ', agentUptimeSeconds = :uptime';
+        expressionAttributeValues[':uptime'] = { N: String(statusData.uptimeSeconds) };
+    }
+     if (statusData.platform !== undefined) {
+        updateExpression += ', agentPlatform = :platform';
+        expressionAttributeValues[':platform'] = { S: statusData.platform };
+    }
+    if (statusData.nodeVersion !== undefined) {
+        updateExpression += ', agentNodeVersion = :nodeVersion';
+        expressionAttributeValues[':nodeVersion'] = { S: statusData.nodeVersion };
+    }
+    // Add more fields as needed
+
+    const command = new UpdateItemCommand({
+        TableName: tableName,
+        Key: marshall({ connectionId }),
+        UpdateExpression: updateExpression,
+        ExpressionAttributeNames: Object.keys(expressionAttributeNames).length > 0 ? expressionAttributeNames : undefined,
+        ExpressionAttributeValues: expressionAttributeValues,
+        ConditionExpression: 'attribute_exists(connectionId)', // Only update if the agent record exists
+        ReturnValues: 'NONE'
+    });
+
+    try {
+        await dynamoDb.send(command);
+        log.info('Successfully updated agent status in registry.');
+        return true;
+    } catch (error: any) {
+        if (error.name === 'ConditionalCheckFailedException') {
+            log.warn({ errorCode: 'ORC-JOB-1000' /* Or specific code */ }, 'Attempted to update status for non-existent/disconnected agent.');
+        } else {
+            log.error({ errorCode: 'ORC-DEP-1002', error: error.message, stack: error.stack }, 'Error updating agent status in registry.');
+        }
+        return false;
     }
 } 
