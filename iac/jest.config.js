@@ -1,9 +1,9 @@
 module.exports = {
   preset: 'ts-jest',
   testEnvironment: 'node',
-  roots: ['<rootDir>/test'],
-  testMatch: ['**/*.test.ts'],
+  testMatch: ['**/test/integration/**/*.test.ts'],
   testTimeout: 60000,
+  setupFiles: ['dotenv/config'],
   transform: {
     '^.+\\.tsx?$': 'ts-jest'
   }
