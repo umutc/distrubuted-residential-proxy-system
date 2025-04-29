@@ -1,10 +1,27 @@
 import WebSocket from 'ws';
 import dotenv from 'dotenv';
-import { request } from 'undici';
 import { setTimeout, clearTimeout } from 'node:timers'; // Explicit Node timers
 import { Buffer } from 'node:buffer'; // Explicit Node buffer
 import process from 'node:process'; // Explicit Node process
-import logger from './logger'; // Import the pino logger
+import http from 'node:http'; // Import HTTP module
+import logger from './logger'; // Corrected path: logger is in the same directory (src)
+import {
+  register,
+  connectionStatusGauge,
+  jobsReceivedCounter,
+  jobsProcessedCounter,
+  jobDurationHistogram,
+  jobHttpRequestErrorCounter,
+  agentStatusGauge,
+  memoryUsageGauge,
+  jobErrorsCounter,
+  activeJobsGauge,
+  websocketErrorsCounter,
+} from './utils/metrics';
+import axios, { AxiosRequestConfig, AxiosResponse, AxiosError } from 'axios';
+import { AgentConfig, JobRequestPayload, JobResponsePayload, ErrorResponsePayload } from './types'; // Corrected path: types.ts is now in the same directory (src)
+import { generateRequestId } from './utils/requestId'; // CORRECTED PATH AGAIN
+import { getAgentId } from './utils/agentId'; // CORRECTED PATH AGAIN
 
 // Load environment variables from .env file
 dotenv.config();
@@ -12,6 +29,7 @@ dotenv.config();
 const orchestratorUrl = process.env.ORCH_WS;
 const agentKey = process.env.AGENT_KEY;
 const GRACE_PERIOD_MS = parseInt(process.env.AGENT_GRACE_PERIOD_MS || '10000', 10); // Default 10 seconds
+const METRICS_PORT = parseInt(process.env.AGENT_METRICS_PORT || '9091', 10); // Add metrics port
 
 if (!orchestratorUrl || !agentKey) {
   logger.fatal({ errorCode: 'AGT-CFG-1001' }, 'Missing ORCH_WS or AGENT_KEY environment variables. Please ensure a .env file exists in the agent directory with these values.');
@@ -39,65 +57,45 @@ let isShuttingDown = false; // Flag for graceful shutdown process
 const activeJobs = new Set<string>(); // Track IDs of jobs currently being processed
 let shutdownTimeoutId: NodeJS.Timeout | null = null; // Timer for grace period
 
-// --- Message Interfaces (Example) ---
+// --- Message Interfaces (Consistently use 'type') ---
 interface BaseMessage {
-    action: string;
+    type: string; // Changed from action
     requestId?: string; // Optional request ID for tracking
     timestamp?: number | string;
 }
 
 interface PingMessage extends BaseMessage {
-    action: 'ping';
-    data?: any; // Optional data for ping
+    type: 'ping'; // Changed from action
+    // data?: any; // Optional data for ping - Removed for simplicity unless needed
 }
 
 interface PongMessage extends BaseMessage {
-    action: 'pong';
-    receivedData?: any; // Echoed data from ping
+    type: 'pong'; // Changed from action
+    receivedTimestamp?: number; // Use specific field for clarity
 }
 
-// --- Job Interfaces ---
-interface JobRequestData {
-    jobId: string;
-    url: string;
-    method: string; // GET, POST, etc.
-    headers?: Record<string, string>;
-    body?: string; // Base64 encoded for binary, otherwise string
-    bodyEncoding?: 'base64' | 'utf8'; // Optional: specify encoding if body is present
-    timeoutMs?: number; // Optional timeout for the request
+// Job request uses JobRequestPayload from types.ts
+interface JobRequest extends BaseMessage {
+    type: 'job_request';
+    payload: JobRequestPayload;
 }
 
-interface JobRequestMessage extends BaseMessage {
-    action: 'job_request';
-    data: JobRequestData;
+// Job response uses JobResponsePayload from types.ts
+interface JobResponse extends BaseMessage {
+    type: 'job_response';
+    jobId: string; // Keep jobId directly on response for easier routing/logging
+    payload: JobResponsePayload;
 }
 
-// Add more interfaces for job responses etc. later
-interface JobResponseMessage extends BaseMessage {
-  action: 'job_response';
-  requestId?: string;
-  data: {
-    jobId: string;
-    success: boolean;
-    response?: {
-      statusCode: number;
-      headers: Record<string, string>;
-      body: string; // Base64 encoded
-    };
-    error?: AgentError;
-  };
+// Error response uses ErrorResponsePayload from types.ts
+interface ErrorResponse extends BaseMessage {
+    type: 'error_response';
+    jobId: string; // Keep jobId directly on response
+    payload: ErrorResponsePayload;
 }
 
-// Structure for standardized errors
-interface AgentError {
-    code: string; // e.g., AGENT_NETWORK_ERROR, AGENT_TARGET_ERROR, AGENT_TIMEOUT
-    message: string;
-    statusCode?: number; // HTTP status code from target if relevant
-    details?: any; // Any additional context
-}
-
-// --- Agent Status Update Message ---
-interface AgentStatusUpdateData {
+// Agent status update
+interface AgentStatusUpdatePayload {
     status: 'connected' | 'shutting_down'; // Agent's perspective
     activeJobCount: number;
     uptimeSeconds: number;
@@ -106,9 +104,45 @@ interface AgentStatusUpdateData {
 }
 
 interface AgentStatusUpdateMessage extends BaseMessage {
-    action: 'agent_status_update';
-    data: AgentStatusUpdateData;
+    type: 'agent_status_update'; // Changed from action
+    payload: AgentStatusUpdatePayload;
 }
+
+// Union type for messages handled by the agent
+type AgentMessage =
+    | PingMessage
+    | PongMessage
+    | JobRequest
+    | AgentStatusUpdateMessage
+    | JobResponse // Included for potential future two-way communication
+    | ErrorResponse; // Included for potential future two-way communication
+
+// Union type for messages sent by the agent
+type SentMessage = PingMessage | AgentStatusUpdateMessage | JobResponse | ErrorResponse;
+
+// --- Metrics Server Setup ---
+const metricsServer = http.createServer(async (req, res) => {
+  if (req.method === 'GET' && req.url === '/metrics') {
+    try {
+      res.setHeader('Content-Type', register.contentType);
+      res.end(await register.metrics());
+    } catch (ex: any) {
+      logger.error({ errorCode: 'AGT-MET-1001', error: ex.message, stack: ex.stack }, 'Error serving metrics');
+      res.writeHead(500).end(ex.message);
+    }
+  } else {
+    res.writeHead(404).end('Not Found');
+  }
+});
+
+metricsServer.listen(METRICS_PORT, () => {
+  logger.info({ port: METRICS_PORT }, `📊 Metrics server listening on port`);
+});
+
+metricsServer.on('error', (err) => {
+    logger.error({ errorCode: 'AGT-MET-1002', error: err.message, stack: err.stack }, 'Metrics server error');
+});
+// --- End Metrics Server Setup ---
 
 function connect() {
   if (isShuttingDown) {
@@ -125,9 +159,10 @@ function connect() {
 
   ws.on('open', () => {
     logger.info('✅ Connected to Orchestrator.');
-    reconnectAttempts = 0; // Reset attempts on successful connection
-    startPing(); // Start heartbeat on successful connection
-    startStatusUpdates(); // Start periodic status updates
+    connectionStatusGauge.set(1); // CORRECTED: Use connectionStatusGauge
+    reconnectAttempts = 0;
+    startPing();
+    startStatusUpdates();
   });
 
   ws.on('message', (data) => {
@@ -136,51 +171,58 @@ function connect() {
         return; // Ignore messages during shutdown phase
     }
     try {
-      const message: BaseMessage = JSON.parse(data.toString());
-      logger.info({ action: message.action, requestId: message.requestId }, `📩 Received action`);
+      // Use the AgentMessage union type for better type safety
+      const message: AgentMessage = JSON.parse(data.toString());
+      logger.info({ type: message.type, requestId: message.requestId }, `📩 Received type`); // Log type instead of action
 
-      // Simple message router
-      switch (message.action) {
+      // Simple message router based on 'type'
+      switch (message.type) {
         case 'pong':
           handlePong(message as PongMessage);
           break;
         case 'job_request':
-          handleJobRequest(message as JobRequestMessage); // Async handling needed
+          handleJobRequest(message as JobRequest); // Async handling needed
           break;
+        // Add cases for other message types the agent might receive if needed
         default:
-          logger.warn({ action: message.action }, `Unknown action received`);
+          // Use exhaustive check pattern (requires tweaking types if not all message types are handled)
+          // const _exhaustiveCheck: never = message;
+          logger.warn({ type: (message as any).type }, `Unknown message type received`);
+          websocketErrorsCounter.inc({ type: 'unknown_message_type' });
       }
     } catch (error: any) {
       logger.error({ errorCode: 'AGT-UNK-1000', error: error.message, stack: error.stack, rawMessage: data.toString() }, 'Error parsing or handling incoming WebSocket message');
+      websocketErrorsCounter.inc({ type: 'Message Handling' }); // Increment WebSocket error counter for handling issues
     }
   });
 
   ws.on('close', (code, reason) => {
     const reasonString = reason.toString() || 'No reason provided';
     logger.info({ code, reason: reasonString }, `❌ Disconnected from Orchestrator.`);
-    stopPing(); // Stop heartbeat on disconnect
-    stopStatusUpdates(); // Stop status updates on disconnect
+    stopPing();
+    stopStatusUpdates();
     ws = null;
-    // Reconnect only if not shutting down intentionally (gracefully or due to max attempts)
+    connectionStatusGauge.set(0); // CORRECTED: Use connectionStatusGauge
+
     if (!isClosingGracefully && !isShuttingDown && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
         attemptReconnect();
     } else if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
          logger.error({ errorCode: 'AGT-NET-1003', attempts: MAX_RECONNECT_ATTEMPTS }, `Max reconnect attempts reached. Not attempting further connections.`);
-         // Optionally exit or notify
-         // gracefulShutdown(1); // Consider triggering shutdown if reconnect fails permanently
     }
   });
 
   ws.on('error', (error) => {
     logger.error({ errorCode: 'AGT-NET-1001', error: error.message, stack: error.stack }, 'WebSocket Error during connection or operation');
-    stopPing(); // Stop ping on error too
-    stopStatusUpdates(); // Stop status updates on error too
-    // Attempt to close cleanly, the 'close' event will handle reconnect logic
+    websocketErrorsCounter.inc({ type: 'WebSocket Operation' });
+    stopPing();
+    stopStatusUpdates();
     if (ws && ws.readyState !== WebSocket.CLOSED && ws.readyState !== WebSocket.CLOSING) {
         logger.info('Closing WebSocket due to error.');
-        ws.close(1011, "WebSocket Error"); // Use appropriate code if needed
+        connectionStatusGauge.set(0); // CORRECTED: Use connectionStatusGauge
+        ws.close(1011, "WebSocket Error");
+    } else {
+        connectionStatusGauge.set(0); // CORRECTED: Ensure gauge is 0 if already closed
     }
-    // Note: The 'close' event handler should trigger the reconnect logic if appropriate
   });
 }
 
@@ -216,7 +258,7 @@ function startPing() {
     pingIntervalId = setInterval(() => {
         if (ws && ws.readyState === WebSocket.OPEN && !isShuttingDown) {
             const pingMsg: PingMessage = {
-                action: 'ping',
+                type: 'ping',
                 timestamp: Date.now(),
                 // requestId: uuidv4() // Add request ID if needed for tracking pongs
             };
@@ -243,7 +285,7 @@ function stopPing() {
 function handlePong(message: PongMessage) {
     // Only log if not shutting down, less noise
     if (!isShuttingDown) {
-        const latency = message.timestamp ? Date.now() - Number(message.timestamp) : undefined;
+        const latency = message.receivedTimestamp ? Date.now() - Number(message.receivedTimestamp) : undefined;
         logger.debug({ latencyMs: latency }, `	💓 Received pong.`); // Use debug
     }
     // Optionally track latency or confirm connection is alive
@@ -279,7 +321,7 @@ function sendAgentStatusUpdate(currentStatus: 'connected' | 'shutting_down') {
         return;
     }
 
-    const statusData: AgentStatusUpdateData = {
+    const statusPayload: AgentStatusUpdatePayload = {
         status: currentStatus,
         activeJobCount: activeJobs.size,
         uptimeSeconds: Math.round((Date.now() - agentStartTime) / 1000),
@@ -288,324 +330,289 @@ function sendAgentStatusUpdate(currentStatus: 'connected' | 'shutting_down') {
     };
 
     const statusMessage: AgentStatusUpdateMessage = {
-        action: 'agent_status_update',
+        type: 'agent_status_update', // Changed from action
         timestamp: Date.now(),
-        data: statusData,
+        payload: statusPayload,
     };
-    logger.debug({ statusData }, 'Sending agent status update');
+    logger.debug({ statusPayload }, 'Sending agent status update');
     sendMessage(statusMessage);
 }
 
 // --- Job Handling ---
 
 // Make handleJobRequest async as executeHttpRequest is async
-async function handleJobRequest(message: JobRequestMessage) {
-    // 1. Check if shutting down
-    if (isShuttingDown) {
-      logger.warn({ jobId: message.data?.jobId, requestId: message.requestId }, `Received job request during shutdown, rejecting.`);
-      // Use specific error code from docs/error-codes.md
-      sendErrorResponse(message.requestId, message.data?.jobId, 'Agent is shutting down', 'AGT-SHT-1001'); 
-      return;
-    }
+async function handleJobRequest(message: JobRequest) { // Use JobRequest type
+  const { payload, requestId = generateRequestId() } = message;
+  const { jobId } = payload;
 
-    logger.info({ jobId: message.data?.jobId, requestId: message.requestId, url: message.data?.url, method: message.data?.method }, `Received job request`);
+  logger.info({ jobId, requestId }, `Received job request`);
+  jobsReceivedCounter.inc(); // Increment jobs received counter
+  activeJobsGauge.inc(); // Increment active jobs gauge
+  agentStatusGauge.set(0); // Set agent status to busy
 
-    // --- Robust Validation ---
-    if (!message.data) {
-        logger.error({ requestId: message.requestId, errorCode: 'AGT-VAL-1001' }, 'Invalid job request: Missing data field.');
-        sendErrorResponse(message.requestId, undefined, 'Invalid job request: Missing data field', 'AGT-VAL-1001');
-        return;
-    }
+  // Track the active job ID
+  activeJobs.add(jobId);
 
-    const { jobId, url, method, headers, body, bodyEncoding, timeoutMs } = message.data;
+  const jobTimerEnd = jobDurationHistogram.startTimer(); // Start job duration timer
 
-    // Basic validation (keep concise for example)
-    if (!jobId || !url || !method) {
-         logger.warn({ jobId, requestId: message.requestId, errorCode: 'AGT-VAL-1001' }, 'Invalid job request: Missing required fields (jobId, url, method)');
-         sendErrorResponse(message.requestId, jobId, 'Invalid job request: Missing required fields (jobId, url, method)', 'AGT-VAL-1001');
-         return;
-    }
-     try {
-        new URL(url); // Basic URL format check
-    } catch (e) {
-        logger.warn({ jobId, url, requestId: message.requestId, errorCode: 'AGT-VAL-1001' }, 'Invalid job request: Malformed URL');
-        sendErrorResponse(message.requestId, jobId, 'Invalid job request: Malformed URL', 'AGT-VAL-1001');
-        return;
-    }
-     if (!['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'].includes(method.toUpperCase())) {
-        logger.warn({ jobId, method, requestId: message.requestId, errorCode: 'AGT-VAL-1001' }, `Invalid job request: Invalid method`);
-        sendErrorResponse(message.requestId, jobId, `Invalid job request: Invalid method: ${method}`, 'AGT-VAL-1001');
-        return;
-    }
-    // Add other validations as needed...
-    // --- End Validation ---
+  try {
+    // Pass the entire payload to executeHttpRequest
+    const response: AxiosResponse<Buffer> = await executeHttpRequest(
+      payload, // Pass the full payload object
+      requestId,
+      jobId
+    );
 
-    // 2. Add job to active set *before* execution
-    activeJobs.add(jobId);
-    logger.info({ jobId, activeJobCount: activeJobs.size }, `Job added to active set.`);
+    // Success
+    sendSuccessResponse(jobId, response, requestId);
+    jobsProcessedCounter.labels('success').inc(); // Increment success counter
+    jobTimerEnd({ method: payload.method, status_code: response.status }); // Observe duration
 
-    try {
-        let requestBody: Buffer | string | undefined = undefined;
-        if (body) {
-            if (bodyEncoding === 'base64') {
-                try {
-                    requestBody = Buffer.from(body, 'base64');
-                } catch (e: any) {
-                    // Cannot return here directly, need to go to finally block to remove from activeJobs
-                    // Throw an error instead to be caught by the outer catch block
-                    logger.error({ jobId, error: e.message, requestId: message.requestId, errorCode: 'AGT-JOB-1003' }, 'Failed to decode base64 body');
-                    throw new Error(`Failed to decode base64 body: ${e.message}`);
-                }
-            } else {
-                requestBody = body; // Assume utf8 if not base64
-            }
+  } catch (error: any) {
+    let errorCode = 'AGT-JOB-1001'; // Default job execution error
+    let errorMessage = 'Job execution failed';
+    let httpStatusCode: number | null = null;
+
+    // Log HTTP request errors with specific label
+    if (axios.isAxiosError(error)) {
+        if (error.response) {
+            // The request was made and the server responded with a status code
+            // that falls out of the range of 2xx
+            httpStatusCode = error.response.status;
+            errorMessage = `Target server responded with error: ${httpStatusCode}`;
+            errorCode = `HTTP_${httpStatusCode}`;
+            jobHttpRequestErrorCounter.labels({ error_code: errorCode }).inc();
+        } else if (error.request) {
+            // The request was made but no response was received
+            errorMessage = 'No response received from target server';
+            errorCode = error.code || 'NO_RESPONSE'; // e.g., ECONNREFUSED, ETIMEDOUT
+            jobHttpRequestErrorCounter.labels({ error_code: errorCode }).inc();
+        } else {
+            // Something happened in setting up the request that triggered an Error
+            errorMessage = `Request setup error: ${error.message}`;
+            errorCode = 'REQUEST_SETUP_ERROR';
+            jobHttpRequestErrorCounter.labels({ error_code: errorCode }).inc();
         }
-        // Execute the HTTP request
-        await executeHttpRequest(jobId, url, method, headers, requestBody, timeoutMs, message.requestId);
-
-    } catch (error) {
-        // Catch errors *during* the setup/preparation before executeHttpRequest
-        // OR errors thrown deliberately (like the base64 decode failure)
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        let errorCode = 'AGT-UNK-1000'; // Default unknown error
-        if (errorMessage.includes('Failed to decode base64 body')) {
-             errorCode = 'AGT-JOB-1003';
-        }
-        logger.error({ jobId, error: errorMessage, errorCode, requestId: message.requestId }, `Error during job request handling or setup`);
-        // Ensure an error response is sent IF executeHttpRequest wasn't the source of the error
-        // (executeHttpRequest sends its own errors)
-        // Check if the error originated from our setup phase
-        if (!(error instanceof Error && error.message.startsWith('Failed executing HTTP request'))) { // Heuristic check
-             sendErrorResponse(message.requestId, jobId, `Internal agent error during job setup: ${errorMessage}`, errorCode, 500);
-        }
-    } finally {
-        // 3. Remove job from active set in finally block
-        activeJobs.delete(jobId);
-        logger.info({ jobId, activeJobCount: activeJobs.size }, `Job removed from active set.`);
-
-        // 4. Check if shutdown is pending and this was the last job
-        if (isShuttingDown && activeJobs.size === 0) {
-            logger.info('Last active job completed during shutdown.');
-            if (shutdownTimeoutId) {
-                clearTimeout(shutdownTimeoutId); // Cancel the force-shutdown timer
-                shutdownTimeoutId = null;
-            }
-            closeConnectionAndExit(0); // Exit cleanly
-        }
+    } else {
+        // Non-axios error during execution
+        errorMessage = `Unexpected error during job execution: ${error.message}`;
+        errorCode = 'UNEXPECTED_EXECUTION_ERROR';
+        jobHttpRequestErrorCounter.labels({ error_code: errorCode }).inc(); // Use generic code
     }
+
+    logger.error({ jobId, requestId, errorCode, errorMessage, error: error.message, stack: error.stack }, 'Job execution failed');
+    sendErrorResponse(jobId, errorCode, errorMessage, httpStatusCode, requestId);
+    jobsProcessedCounter.labels('error').inc(); // Increment error counter
+    jobErrorsCounter.labels({ error_code: errorCode, status_code: httpStatusCode ?? 'N/A' }).inc(); // Also log to the specific jobErrorsCounter
+    // Observe duration even on error, potentially label differently?
+    jobTimerEnd({ method: payload.method, status_code: httpStatusCode ?? 'error' }); // Use 'error' or actual code
+
+  } finally {
+    // Ensure job ID is removed and gauges are updated regardless of success/failure
+    activeJobs.delete(jobId);
+    activeJobsGauge.dec(); // Decrement active jobs gauge
+    // Set agent status back to available only if no other jobs are active
+    if (activeJobs.size === 0) {
+      agentStatusGauge.set(1);
+    }
+  }
 }
 
 async function executeHttpRequest(
-    jobId: string,
-    url: string,
-    method: string,
-    headers?: Record<string, string>,
-    body?: Buffer | string, // Accept Buffer or string
-    timeoutMs?: number,
-    requestId?: string
-) {
-    logger.info({ jobId, method, url, requestId }, `Executing HTTP request`);
-    const effectiveTimeout = timeoutMs || 30000; // Default 30s timeout
+    requestPayload: JobRequestPayload, // Use payload type
+    requestId: string,
+    jobId: string // Pass jobId explicitly for logging
+): Promise<AxiosResponse<Buffer>> { // Return the full AxiosResponse
+    const { url, method, headers, body, bodyEncoding, timeoutMs = 30000 } = requestPayload;
+    logger.info(`Executing target request for job ${jobId}`, { requestId, url, method, timeoutMs });
 
-    try {
-        const { statusCode, headers: responseHeaders, body: responseBodyStream } = await request(url, {
-            method: method.toUpperCase(),
-            headers: {
-                ...headers, // Spread incoming headers
-                'User-Agent': `DistributedAgent/1.0 (JobId: ${jobId})`, // Example User-Agent
-            },
-            body: body,
-            bodyTimeout: effectiveTimeout, // Timeout for receiving the body
-            headersTimeout: effectiveTimeout, // Timeout for receiving headers
-            // connectTimeout: 10000, // Removed as it's not standard
-            // Allow throwing errors for non-2xx status codes for simpler handling below
-            // throwOnError: true, // Consider if this simplifies error logic vs checking statusCode
-        });
+    const config: AxiosRequestConfig = {
+        url,
+        method: method.toUpperCase() as any,
+        headers: headers || {},
+        timeout: timeoutMs,
+        responseType: 'arraybuffer',
+        validateStatus: (status) => status >= 100 && status < 600,
+    };
 
-        logger.info({ jobId, statusCode, requestId }, `Received response from target`);
-
-        // Consume the stream and collect into a buffer
-        const chunks: Buffer[] = []; // Explicitly type chunks as Buffer[]
-        for await (const chunk of responseBodyStream) {
-            chunks.push(chunk);
+    if (body) {
+        config.data = (bodyEncoding === 'base64') ? Buffer.from(body, 'base64') : body;
+        if (bodyEncoding !== 'base64' && !config.headers?.['Content-Type']) {
+            config.headers = { ...config.headers, 'Content-Type': 'text/plain; charset=utf-8' };
         }
-        const completeBodyBuffer = Buffer.concat(chunks);
-
-        // Convert headers object (IncomingHttpHeaders) to simple Record<string, string>
-        const simpleHeaders: Record<string, string> = {};
-        for (const [key, value] of Object.entries(responseHeaders)) {
-           if (value !== undefined) {
-             // Handle single string value, array of strings, or undefined
-             simpleHeaders[key] = Array.isArray(value) ? value.join(', ') : String(value);
-           }
-        }
-
-        // Send success (even for non-2xx status codes from the target)
-        sendSuccessResponse(requestId, jobId, statusCode, simpleHeaders, completeBodyBuffer);
-
-    } catch (error: any) {
-        // Default error code
-        let errorCode = 'AGT-JOB-1000'; // General job execution failure
-        let message = `Failed executing HTTP request: Unknown error`;
-        let statusCode: number | undefined = undefined; // HTTP status from error if available
-
-        // Log the raw error first for debugging
-        logger.error({ jobId, rawError: error, errorCode: 'RAW_HTTP_EXEC_ERROR', requestId }, `Raw error during HTTP request execution`);
-
-        // --- Map common error scenarios to specific codes --- 
-        if (error && typeof error === 'object') {
-             // undici specific errors often have codes
-            if ('code' in error) {
-                message = `${error.code} - ${error.message}`;
-                if (error.code === 'UND_ERR_CONNECT_TIMEOUT') { // Note: connectTimeout is implicit in headersTimeout usually
-                    errorCode = 'AGT-NET-1005'; 
-                } else if (error.code === 'UND_ERR_HEADERS_TIMEOUT' || error.code === 'UND_ERR_BODY_TIMEOUT') {
-                    errorCode = 'AGT-JOB-1001';
-                } else if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED' || error.code === 'ECONNRESET') {
-                     errorCode = 'AGT-NET-1006';
-                } // Add more specific undici error codes if needed
-            } else {
-                 message = `${error.message || 'Unknown error'}`;
-            }
-             // Check if it resembles an HTTP error structure from undici or target
-            if ('statusCode' in error && typeof error.statusCode === 'number') {
-                statusCode = error.statusCode;
-                errorCode = 'AGT-JOB-1002'; // Use this for any target response error
-                message = `${error.message || 'Unknown error'}`;
-            } else if ('response' in error && error.response && 'statusCode' in error.response && typeof error.response.statusCode === 'number') {
-                // Handle cases where undici wraps the response in error
-                statusCode = error.response.statusCode;
-                errorCode = 'AGT-JOB-1002';
-                message = `${error.message || 'Unknown error'}`;
-            }
-        } else {
-            message = `${String(error)}`;
-        }
-
-        // Cast error to unknown when passing as details
-        // Log the specific error details being sent back
-        logger.warn({ jobId, errorCode, message, statusCode: statusCode, details: error as unknown, requestId }, "Sending error response for HTTP request failure");
-        sendErrorResponse(requestId, jobId, message, errorCode, statusCode, error as unknown);
-        // Explicitly create and type the error object before throwing
-        const executionError: Error = new Error(String(message));
-        throw executionError;
     }
+
+    let response: AxiosResponse<Buffer>;
+    try {
+        response = await axios(config);
+        logger.info(`Target request successful for job ${jobId}`, {
+            requestId,
+            statusCode: response.status,
+            responseLength: response.data.length,
+        });
+    } catch (error: any) {
+        jobErrorsCounter.inc({
+            error_code: error.code || 'AXIOS_ERROR',
+            status_code: (error.response?.status || 500).toString(),
+        });
+        logger.error(`Target request failed for job ${jobId}`, {
+            requestId,
+            errorMessage: error.message,
+            errorCode: error.code,
+            targetStatusCode: error.response?.status,
+        });
+        throw error; // Re-throw
+    }
+
+    return response; // Return the full Axios response
 }
 
-function sendSuccessResponse(requestId: string | undefined, jobId: string, statusCode: number, headers: Record<string, string>, body: Buffer) {
-    const response: JobResponseMessage = {
-        action: 'job_response',
-        requestId: requestId, // Include original requestId if present
-        timestamp: Date.now(),
-        data: {
-            jobId: jobId,
-            success: true,
-            response: {
-                statusCode: statusCode,
-                headers: headers,
-                body: body.toString('base64') // Always encode body as Base64
-            }
-        }
+// Send a successful job response back to the master
+const sendSuccessResponse = (
+  jobId: string,
+  response: AxiosResponse<Buffer>, // Expect full AxiosResponse<Buffer>
+  requestId: string
+) => {
+    // Determine response encoding: Base64 for binary types, UTF8 otherwise
+    const contentType = response.headers['content-type'] || '';
+    const isBinary = contentType.startsWith('image/') ||
+                     contentType.startsWith('audio/') ||
+                     contentType.startsWith('video/') ||
+                     contentType === 'application/octet-stream' ||
+                     contentType === 'application/pdf' ||
+                     contentType === 'application/zip';
+    const bodyEncoding = isBinary ? 'base64' : 'utf8';
+
+    const responsePayload: JobResponsePayload = {
+        statusCode: response.status,
+        headers: response.headers as Record<string, string>, // Assert type
+        body: Buffer.from(response.data).toString(bodyEncoding),
+        bodyEncoding: bodyEncoding,
     };
-    sendMessage(response);
-    logger.info({ jobId, targetStatusCode: statusCode, requestId }, `Success response sent`);
-}
 
-function sendErrorResponse(requestId: string | undefined, jobId: string | undefined, message: string, errorCode: string, statusCode?: number, details?: any) {
-     // Ensure jobId is included if available, even if it's just from the initial request
-    const effectiveJobId = jobId || (requestId ? `unknown_job_for_${requestId}` : 'unknown_job');
-
-    const errorResponse: JobResponseMessage = {
-        action: 'job_response',
-        requestId: requestId,
-        timestamp: Date.now(),
-        data: {
-            jobId: effectiveJobId,
-            success: false,
-            error: {
-                code: errorCode,
-                message: message,
-                statusCode: statusCode, // Include original status if available (e.g., 404 from target)
-                details: details ? JSON.stringify(details) : undefined // Add extra context if needed
-            }
-        }
+    const responseMessage: JobResponse = {
+        type: 'job_response', // Changed from action
+        jobId,
+        requestId,
+        payload: responsePayload,
     };
-    sendMessage(errorResponse);
-     logger.error({ jobId: effectiveJobId, errorCode, message, statusCode, requestId }, `Error response sent`);
-}
+    sendMessage(responseMessage);
+    jobsProcessedCounter.inc({ status: 'success' });
+    logger.info(`Sent success response for job ${jobId}`, { jobId, statusCode: response.status, requestId });
+};
 
-function sendMessage(message: BaseMessage) {
+// Send an error response back to the master
+const sendErrorResponse = (
+  jobId: string,
+  errorCode: string,
+  errorMessage: string,
+  statusCode: number | null,
+  requestId: string
+) => {
+    const errorPayload: ErrorResponsePayload = {
+        errorCode,
+        errorMessage,
+        statusCode: statusCode || undefined,
+    };
+
+    const errorResponseMessage: ErrorResponse = {
+        type: 'error_response', // Changed from action
+        jobId,
+        requestId,
+        payload: errorPayload,
+    };
+    jobsProcessedCounter.inc({ status: 'failed' });
+    jobErrorsCounter.inc({ error_code: errorCode, status_code: String(statusCode || 'N/A') });
+    sendMessage(errorResponseMessage);
+    logger.warn(`Sent error response for job ${jobId}: ${errorCode}`, { jobId, errorCode, errorMessage, statusCode, requestId });
+};
+
+// Helper function to send messages, handles potential null ws
+// Uses the SentMessage union type for better type safety
+const sendMessage = (message: SentMessage) => {
   if (ws && ws.readyState === WebSocket.OPEN) {
     try {
       ws.send(JSON.stringify(message));
     } catch (error: any) {
-      logger.error({ action: message.action, error: error.message, errorCode: 'AGT-NET-1004' }, 'Error sending message via WebSocket');
-      // Attempt to close connection if send fails, reconnect logic will handle it
-       if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.close(1011, "Send Error");
-       }
+      // Use message.type now
+      logger.error(
+        { messageType: message.type, jobId: (message as any).jobId, requestId: message.requestId, error: error.message, stack: error.stack },
+        'Failed to send message via WebSocket'
+      );
+      websocketErrorsCounter.inc({ type: 'send_error' });
     }
   } else {
-    logger.warn({ action: message.action }, `Cannot send message, WebSocket not open.`);
-    // Don't attempt reconnect here, let the close/error handlers manage it
+    // Use message.type now
+    logger.error(
+      { messageType: message.type, jobId: (message as any).jobId, requestId: message.requestId },
+      'WebSocket not open. Cannot send message.'
+    );
+    websocketErrorsCounter.inc({ type: 'send_error_not_open' });
+    // Potentially queue message or handle error differently
   }
-}
+};
 
 // --- Graceful Shutdown Logic ---
 function gracefulShutdown(exitCode: number = 0) {
     if (isShuttingDown) {
-        logger.info('Shutdown already in progress.');
-        return; // Prevent redundant shutdown calls
+        logger.warn('Graceful shutdown already in progress.');
+        return; // Avoid duplicate shutdowns
     }
     isShuttingDown = true;
-    logger.info({ exitCode }, `🚨 Initiating graceful shutdown...`);
-    stopPing(); // Stop sending pings
-    stopStatusUpdates(); // Stop periodic updates
+    logger.info({ exitCode }, `Initiating graceful shutdown...`);
 
-    // Send final status update indicating shutdown
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        sendAgentStatusUpdate('shutting_down');
-    }
+    // Stop accepting new connections/work immediately
+    isClosingGracefully = true; // Prevent immediate reconnect attempts
+    stopPing();
+    stopStatusUpdates();
+    // Update status gauge if needed (e.g., to a specific shutdown state)
+    // connectionStatusGauge.set(-1); // Example: Set to -1 during shutdown
 
-    if (reconnectTimeoutId) {
-        clearTimeout(reconnectTimeoutId); // Cancel any pending reconnect
-        reconnectTimeoutId = null;
-    }
+    // Send shutdown notification to orchestrator
+    sendAgentStatusUpdate('shutting_down');
 
-    if (activeJobs.size === 0) {
-        logger.info('No active jobs. Shutting down immediately.');
+    const shutdownAction = () => {
+        logger.info("Grace period ended or no active jobs. Closing connection.");
         closeConnectionAndExit(exitCode);
-    } else {
-        logger.info({ jobCount: activeJobs.size, gracePeriodSec: GRACE_PERIOD_MS / 1000 }, `Waiting for active jobs to complete...`);
-        logger.info({ activeJobIds: Array.from(activeJobs) }, 'Active job IDs');
+    };
 
-        // Set a timer to force exit if jobs don't finish
+    if (activeJobs.size > 0) {
+        logger.info({ activeJobCount: activeJobs.size, gracePeriodMs: GRACE_PERIOD_MS }, `Waiting for active jobs to complete...`);
+        // Set a timeout for the grace period
         shutdownTimeoutId = setTimeout(() => {
-            logger.warn({ gracePeriodSec: GRACE_PERIOD_MS / 1000 }, `Grace period expired. Forcing shutdown.`);
-            logger.warn({ activeJobIds: Array.from(activeJobs) }, `Jobs still active`);
-            closeConnectionAndExit(1); // Use non-zero exit code for forced shutdown
+            logger.warn({ gracePeriodMs: GRACE_PERIOD_MS }, 'Grace period expired. Forcing shutdown.');
+            // Force close potentially interrupting jobs
+            shutdownAction();
         }, GRACE_PERIOD_MS);
+        // We rely on the finally block of handleJobRequest to call shutdownAction when activeJobs.size becomes 0
+    } else {
+        logger.info('No active jobs. Proceeding with immediate shutdown.');
+        shutdownAction();
     }
 }
 
 function closeConnectionAndExit(exitCode: number) {
-     logger.info({ exitCode }, `Closing WebSocket connection and exiting...`);
-     isClosingGracefully = true; // Prevent reconnect attempts from the 'close' handler
-     if (shutdownTimeoutId) { // Clear timeout if we are exiting before it fires
+    if (shutdownTimeoutId) {
         clearTimeout(shutdownTimeoutId);
         shutdownTimeoutId = null;
-     }
-
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.close(1000, 'Graceful shutdown'); // 1000 is normal closure
-    } else if (ws && ws.readyState === WebSocket.CONNECTING) {
-         ws.terminate(); // Force close if still connecting
     }
-     // Add a small delay to allow the close frame to potentially be sent
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      logger.info('Closing WebSocket connection before exiting...');
+      isClosingGracefully = true; // Ensure flag is set
+      connectionStatusGauge.set(0); // CORRECTED: Set gauge to 0 on final close
+      ws.close(1000, 'Agent shutting down gracefully'); // Normal closure
+    }
+    logger.info({ exitCode }, `Exiting agent process.`);
+    // Close metrics server gracefully
+    metricsServer.close(() => {
+      logger.info('Metrics server closed.');
+      process.exit(exitCode);
+    });
+    // Force exit if metrics server doesn't close quickly
     setTimeout(() => {
-        logger.info({ exitCode }, "Exiting process.");
+        logger.warn('Metrics server close timeout exceeded. Forcing exit.');
         process.exit(exitCode);
-    }, 250); // Delay exit slightly
+    }, 2000); // 2 second timeout
 }
 
 // --- Global Error Handlers ---
