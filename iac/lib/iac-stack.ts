@@ -222,6 +222,23 @@ export class OrchestratorStack extends cdk.Stack {
     });
     // <<< END: Add Metrics Handler >>>
 
+    // <<< START: Add Agent Monitoring Handler >>>
+    const agentMonitoringHandler = new lambda_nodejs.NodejsFunction(this, 'AgentMonitoringHandler', {
+      entry: path.join(__dirname, '../lambda/handlers/agent-monitoring.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_LATEST,
+      role: lambdaHandlerRole, // Reuse shared role initially
+      environment: lambdaEnvironment, 
+    });
+    // Grant read access to the Agent Registry table
+    agentRegistryTable.grantReadData(agentMonitoringHandler);
+    new logs.LogGroup(this, 'AgentMonitoringHandlerLogGroup', {
+      logGroupName: `/aws/lambda/${agentMonitoringHandler.functionName}`,
+      retention: logs.RetentionDays.ONE_WEEK,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+    // <<< END: Add Agent Monitoring Handler >>>
+
     // --- WebSocket API Gateway ---
     const webSocketApi = new apigwv2.WebSocketApi(this, 'ResidentialProxyWebSocketApi', {
       apiName: 'ResidentialProxyWebSocketApi',
@@ -242,7 +259,7 @@ export class OrchestratorStack extends cdk.Stack {
     });
     // Update Lambda environment with the final WebSocket URL
     const webSocketUrl = stage.url;
-    [connectHandler, disconnectHandler, defaultHandler, jobIngestionHandler, orchestratorDispatcherHandler, metricsHandler].forEach(handler => {
+    [connectHandler, disconnectHandler, defaultHandler, jobIngestionHandler, orchestratorDispatcherHandler, metricsHandler, agentMonitoringHandler].forEach(handler => {
          handler.addEnvironment('WEBSOCKET_API_ENDPOINT', webSocketUrl);
     });
 
@@ -312,6 +329,15 @@ export class OrchestratorStack extends cdk.Stack {
         integration: new HttpLambdaIntegration('MetricsIntegration', metricsHandler),
     });
     // <<< END: Add Metrics Route >>>
+
+    // <<< START: Add Agent Monitoring Route >>>
+    httpApi.addRoutes({
+        path: '/agents',
+        methods: [ apigw_http.HttpMethod.GET ],
+        integration: new HttpLambdaIntegration('AgentMonitoringIntegration', agentMonitoringHandler),
+        // TODO: Add authorizer once authentication is implemented for this endpoint (Subtask 9.10)
+    });
+    // <<< END: Add Agent Monitoring Route >>>
 
     // --- Grant Secrets Manager Read Permissions ---
     agentApiKeysSecret.grantRead(connectHandler);
