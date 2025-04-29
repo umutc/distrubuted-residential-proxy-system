@@ -1,0 +1,58 @@
+get:
+  summary: List registered agents
+  description: Retrieves a list of currently registered agents, optionally filtered by status, with pagination.
+  operationId: listAgents
+  tags:
+    - Agent Monitoring
+  parameters:
+    - name: status
+      in: query
+      description: Filter agents by status (e.g., connected, active, busy).
+      required: false
+      schema:
+        type: string
+        enum: [connected, active, busy, available] # Extend as needed
+    - name: limit
+      in: query
+      description: Maximum number of agents to return.
+      required: false
+      schema:
+        type: integer
+        format: int32
+        minimum: 1
+        default: 20
+    - name: nextToken
+      in: query
+      description: Token for retrieving the next page of results.
+      required: false
+      schema:
+        type: string
+  responses:
+    '200':
+      description: A list of agents matching the criteria.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              agents:
+                type: array
+                items:
+                  $ref: '../components/schemas/AgentInfo.yaml'
+              nextToken:
+                type: string
+                nullable: true
+                description: Token for the next page, or null if no more results.
+                example: 'eyJsYXN0RXZhbHVhdGVkS2V5IjogeyJjb25uZWN0aW9uSWQiOiB7IlMiOiAiYWJjMTIzIn19fQ==' # Example base64 token
+    '400':
+      description: Bad request (e.g., invalid limit parameter).
+      content:
+        application/json:
+          schema:
+            $ref: '../components/schemas/Error.yaml'
+    '500':
+      description: Internal server error.
+      content:
+        application/json:
+          schema:
+            $ref: '../components/schemas/Error.yaml' 
