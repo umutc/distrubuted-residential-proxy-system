@@ -1,4 +1,7 @@
 {
+  "scripts": {
+    "test": "vitest run --coverage"
+  },
   "dependencies": {
     "@aws-cdk/aws-iam": "^1.203.0",
     "@aws-cdk/aws-lambda-nodejs": "^1.203.0",
@@ -7,5 +10,11 @@
     "aws-sdk": "^2.1692.0",
     "dotenv": "^16.5.0",
     "ws": "^8.18.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "@vitest/coverage-v8": "^3.1.2",
+    "vitest": "^3.1.2",
+    "vitest-mock-extended": "^3.1.0"
   }
 }
